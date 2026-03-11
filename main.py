@@ -1,1630 +1,1362 @@
-import logging
-import os
-import json
-from datetime import datetime, timedelta
-from typing import Optional
 import asyncio
-import asyncpg
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    CallbackQueryHandler
-)
-import requests
-import types
-import csv
-import io
-import pytz
-from generator import LicenseGenerator
+import os
 
-# --- Настройка логирования ---
+import asyncpg
+import logging
+import time
+import subprocess
+import shlex
+import re
+import json
+import requests
+from typing import Dict, Any, Optional, List, Tuple
+
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardButton, InlineKeyboardMarkup
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# Импортируем конфигурацию
+from environment import BOT_VERSION, SESSION_DURATION
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+DATABASE_URL = os.getenv('DATABASE_URL')
+
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- Отключаем лишние логи ---
-logging.getLogger("httpx").setLevel(logging.ERROR)
-logging.getLogger("telegram").setLevel(logging.ERROR)
-
-# --- Переменные окружения ---
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-DATABASE_URL = os.getenv('DATABASE_URL')
-
-if not BOT_TOKEN:
-    raise ValueError("❌ Не задана переменная окружения BOT_TOKEN")
-if not DATABASE_URL:
-    raise ValueError("❌ Не задана переменная окружения DATABASE_URL")
+# Создаем экземпляры бота и диспетчера
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
 
-# --- Класс для работы с БД ---
-class Database:
-    """Класс для работы с базой данных"""
+# Состояния для FSM
+class EditStates(StatesGroup):
+    waiting_for_period = State()
+    waiting_for_customer = State()
+    waiting_for_search_key = State()
+    waiting_for_search_user = State()
 
+
+# Состояния пользователей
+user_states = {}  # user_id -> {'state': 'waiting_customer', 'customer': None}
+# Хранилище для пагинации ключей
+user_pages = {}  # user_id -> current_page
+# Временное хранение для редактирования
+edit_data = {}  # user_id -> {'key': key, 'action': action}
+
+
+# Класс для управления сессиями
+class SessionManager:
+    def __init__(self, duration_minutes: int = 30):
+        self.sessions = {}
+        self.duration = duration_minutes * 60
+
+    def create_session(self, user_id: int) -> None:
+        expiry = time.time() + self.duration
+        self.sessions[user_id] = expiry
+        logger.info(f"Session created for user {user_id}")
+
+    def is_session_valid(self, user_id: int) -> bool:
+        if user_id not in self.sessions:
+            return False
+        expiry = self.sessions[user_id]
+        if time.time() > expiry:
+            del self.sessions[user_id]
+            return False
+        return True
+
+    def refresh_session(self, user_id: int) -> None:
+        if user_id in self.sessions:
+            expiry = time.time() + self.duration
+            self.sessions[user_id] = expiry
+
+    def end_session(self, user_id: int) -> None:
+        if user_id in self.sessions:
+            del self.sessions[user_id]
+
+
+# Класс для работы с БД и Gist
+class LicenseBotDB:
     def __init__(self):
         self.pool = None
-        self._cache = {}
-        self._last_update = None
-        self._update_interval = timedelta(minutes=5)
+        self.tokens = {}
 
-    async def init_pool(self):
-        """Инициализация пула соединений"""
+    async def init_db(self):
         try:
-            self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-            logger.info("✅ Пул соединений с БД создан")
-            await self._load_config()
+            self.pool = await asyncpg.create_pool(DATABASE_URL)
+            logger.info("Connected to database")
+            await self.ensure_table_exists()
+            await self.load_tokens()
         except Exception as e:
-            logger.error(f"❌ Ошибка создания пула: {e}")
+            logger.error(f"Failed to connect: {e}")
             raise
 
-    async def close_pool(self):
-        """Закрытие пула соединений"""
-        if self.pool:
-            await self.pool.close()
-            logger.info("✅ Пул соединений закрыт")
-
-    async def _load_config(self):
-        """Загрузка конфигурации из БД"""
-        try:
-            async with self.pool.acquire() as conn:
-                # Проверяем существование таблицы
+    async def ensure_table_exists(self):
+        async with self.pool.acquire() as conn:
+            exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'tokens')")
+            if not exists:
                 await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS tokens (
+                    CREATE TABLE tokens (
                         id SERIAL PRIMARY KEY,
-                        gitToken TEXT NOT NULL,
-                        gistId TEXT NOT NULL,
-                        gistFileName TEXT NOT NULL DEFAULT 'licenses.json',
-                        adminPassword TEXT NOT NULL,
-                        adminId1 TEXT,
-                        adminId2 TEXT
+                        gittoken VARCHAR(100),
+                        gistid VARCHAR(100),
+                        gistfilename VARCHAR(100),
+                        adminid1 VARCHAR(100),
+                        adminid2 VARCHAR(100),
+                        adminid3 VARCHAR(100),
+                        adminpassword VARCHAR(100)
                     )
                 """)
+                await conn.execute("""
+                    INSERT INTO tokens (gittoken, gistid, gistfilename, adminid1, adminid2, adminid3, adminpassword)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """, "test", "test", "test.json", "123456789", "", "", "admin123")
 
-                # Получаем первую запись
-                row = await conn.fetchrow("SELECT * FROM tokens LIMIT 1")
+    async def load_tokens(self):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM tokens LIMIT 1")
+            if row:
+                self.tokens = dict(row)
+                logger.info(f"Tokens loaded")
 
-                if row:
-                    self._cache = {
-                        'gittoken': row['gittoken'],
-                        'gistid': row['gistid'],
-                        'gistfilename': row['gistfilename'],
-                        'adminpassword': row['adminpassword'],
-                        'adminid1': row['adminid1'],
-                        'adminid2': row['adminid2']
-                    }
-                    self._last_update = datetime.now()
-                    logger.info("✅ Конфигурация загружена из БД")
-                else:
-                    logger.error("❌ Таблица tokens пуста!")
+    async def is_admin_by_id(self, user_id: int) -> bool:
+        str_id = str(user_id)
+        return str_id == self.tokens.get('adminid1') or str_id == self.tokens.get(
+            'adminid2') or str_id == self.tokens.get('adminid3')
+
+    async def check_password(self, password: str) -> bool:
+        return password == self.tokens.get('adminpassword')
+
+    async def get_gist_data(self) -> Optional[Dict]:
+        """Получает данные из Gist"""
+        try:
+            gittoken = self.tokens.get('gittoken')
+            gistid = self.tokens.get('gistid')
+            filename = self.tokens.get('gistfilename')
+
+            if not all([gittoken, gistid, filename]):
+                logger.error("Missing GitHub credentials")
+                return None
+
+            headers = {
+                'Authorization': f'token {gittoken}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+
+            url = f'https://api.github.com/gists/{gistid}'
+            response = requests.get(url, headers=headers)
+
+            if response.status_code == 200:
+                gist_data = response.json()
+                content = gist_data['files'][filename]['content']
+                return json.loads(content)
+            else:
+                logger.error(f"Failed to fetch gist: {response.status_code}")
+                return None
 
         except Exception as e:
-            logger.error(f"❌ Ошибка загрузки конфигурации: {e}")
+            logger.error(f"Error fetching gist: {e}")
+            return None
 
-    async def get_value(self, column_name: str) -> Optional[str]:
-        """Получение значения по имени колонки"""
-        # Проверяем, нужно ли обновить кеш
-        if not self._last_update or datetime.now() - self._last_update > self._update_interval:
-            await self._load_config()
-
-        return self._cache.get(column_name.lower())
-
-    async def refresh(self):
-        """Принудительное обновление конфигурации"""
-        self._last_update = None
-        await self._load_config()
-
-
-# --- Создаем глобальный экземпляр БД ---
-db = Database()
-
-
-# --- Вспомогательные функции для получения данных ---
-async def get_github_token() -> Optional[str]:
-    """Получает GitHub токен"""
-    return await db.get_value('gittoken')
-
-
-async def get_gist_id() -> Optional[str]:
-    """Получает Gist ID"""
-    return await db.get_value('gistid')
-
-
-async def get_gist_filename() -> Optional[str]:
-    """Получает имя файла в Gist"""
-    return await db.get_value('gistfilename')
-
-
-async def get_admin_password() -> Optional[str]:
-    """Получает пароль администратора"""
-    return await db.get_value('adminpassword')
-
-
-async def get_admin_ids() -> tuple:
-    """Получает ID администраторов"""
-    admin1 = await db.get_value('adminid1')
-    admin2 = await db.get_value('adminid2')
-
-    admin_ids = []
-    for aid in [admin1, admin2]:
-        if aid:
-            try:
-                admin_ids.append(int(aid))
-            except (ValueError, TypeError):
-                pass
-
-    return tuple(admin_ids)
-
-
-# --- Функции для работы с Gist (используют данные из БД) ---
-async def get_licenses_from_gist() -> dict:
-    """Получает лицензии из Gist"""
-    github_token = await get_github_token()
-    gist_id = await get_gist_id()
-    gist_filename = await get_gist_filename()
-
-    if not all([github_token, gist_id, gist_filename]):
-        logger.error("❌ Отсутствуют данные для подключения к Gist")
-        return {}
-
-    headers = {
-        "Authorization": f"token {github_token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-
-    try:
-        response = requests.get(f"https://api.github.com/gists/{gist_id}", headers=headers, timeout=10)
-        if response.status_code == 200:
-            gist_data = response.json()
-            if gist_filename in gist_data['files']:
-                licenses_content = gist_data['files'][gist_filename]['content']
-                raw_dict = json.loads(licenses_content)
-                return {k: v for k, v in raw_dict.items() if v and isinstance(v, dict) and v.get('key')}
-            else:
-                logger.error(f"❌ Файл {gist_filename} не найден в Gist")
-                return {}
-        else:
-            logger.error(f"❌ Ошибка получения Gist: {response.status_code}")
-            return {}
-    except Exception as e:
-        logger.error(f"❌ Ошибка при получении лицензий: {e}")
-        return {}
-
-
-async def save_licenses_to_gist(licenses: dict) -> bool:
-    """Сохраняет лицензии в Gist"""
-    github_token = await get_github_token()
-    gist_id = await get_gist_id()
-    gist_filename = await get_gist_filename()
-
-    if not all([github_token, gist_id, gist_filename]):
-        logger.error("❌ Отсутствуют данные для сохранения в Gist")
-        return False
-
-    headers = {
-        "Authorization": f"token {github_token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-
-    data = {
-        "files": {
-            gist_filename: {
-                "content": json.dumps(licenses, indent=2, ensure_ascii=False)
-            }
-        }
-    }
-
-    try:
-        response = requests.patch(f"https://api.github.com/gists/{gist_id}", headers=headers, json=data, timeout=10)
-        if response.status_code == 200:
-            logger.info("✅ Лицензии сохранены в Gist")
-            return True
-        else:
-            logger.error(f"❌ Ошибка сохранения в Gist: {response.status_code}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ Ошибка при сохранении в Gist: {e}")
-        return False
-
-
-# --- Вспомогательный класс для имитации callback_query ---
-class DummyQuery:
-    def __init__(self, data, from_user, message, chat_id=None):
-        self.data = data
-        self.from_user = from_user
-        self.message = message
-        self.chat_id = chat_id
-
-    async def answer(self, *args, **kwargs):
-        pass
-
-    async def edit_message_text(self, *args, **kwargs):
-        if self.message:
-            await self.message.reply_text(*args, **kwargs)
-        elif self.chat_id and hasattr(self, 'bot'):
-            await self.bot.send_message(chat_id=self.chat_id, *args, **kwargs)
-
-
-# --- ВКЛЮЧЕНИЕ/ОТКЛЮЧЕНИЕ ЛИЦЕНЗИИ ---
-async def toggle_active_license(update, context):
-    query = update.callback_query
-    key = query.data.split('_', 2)[2] if query and hasattr(query, 'data') and query.data else None
-    lic_dict = await get_licenses_from_gist()
-
-    if not lic_dict or key not in lic_dict or lic_dict[key] is None:
-        await query.answer("Ключ не найден!", show_alert=True)
-        return
-
-    info = lic_dict[key]
-    moscow_tz = pytz.timezone('Europe/Moscow')
-
-    if info.get('hasActive'):
-        # Отключить лицензию
-        info['hasActive'] = False
-        info['hwid'] = ""
-        info['issued'] = ""
-        info['expired'] = ""
-        await query.answer(f"🔴 Лицензия {key} отключена!", show_alert=True)
-    else:
-        # Включить лицензию
-        now = datetime.now(moscow_tz)
-        period = info.get('period', 0)
+    async def update_gist_data(self, data: Dict) -> bool:
+        """Обновляет данные в Gist"""
         try:
-            period = int(float(period))
-        except Exception:
-            period = 0
+            gittoken = self.tokens.get('gittoken')
+            gistid = self.tokens.get('gistid')
+            filename = self.tokens.get('gistfilename')
 
-        info['issued'] = now.strftime('%d.%m.%Y %H:%M')
-        if period > 0:
-            info['expired'] = (now + timedelta(days=period)).strftime('%d.%m.%Y %H:%M')
-        else:
-            info['expired'] = ''
-        info['hasActive'] = True
-        await query.answer(f"🟢 Лицензия {key} включена!", show_alert=True)
-
-    await save_licenses_to_gist(lic_dict)
-
-    # Обновляем окно редактирования
-    dummy_update = types.SimpleNamespace()
-    dummy_update.callback_query = DummyQuery(f"edit_{key}", query.from_user, query.message,
-                                             getattr(query.message, 'chat_id', None))
-    await edit_key_menu(dummy_update, context)
-
-
-# --- АВТОРИЗАЦИЯ ---
-async def check_admin_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Проверяет авторизацию администратора"""
-    user_id = update.effective_user.id if update.effective_user else None
-    admin_ids = await get_admin_ids()
-    admin_password = await get_admin_password()
-
-    if user_id in admin_ids:
-        return True
-
-    if context.user_data and context.user_data.get('admin_authenticated'):
-        return True
-
-    if update.message and update.message.text:
-        if context.user_data and context.user_data.get('awaiting_password'):
-            password = update.message.text.strip()
-            if password == admin_password:
-                context.user_data['admin_authenticated'] = True
-                context.user_data['awaiting_password'] = False
-                await show_main_menu(update, context, "✅ Доступ разрешён!")
-                return True
-            else:
-                await update.message.reply_text("❌ Неверный пароль. Попробуйте ещё раз.")
+            if not all([gittoken, gistid, filename]):
+                logger.error("Missing GitHub credentials")
                 return False
 
-    if update.message:
-        await update.message.reply_text("🔒 Введите пароль администратора:")
-    elif update.callback_query:
-        await update.callback_query.edit_message_text("🔒 Введите пароль администратора:")
+            headers = {
+                'Authorization': f'token {gittoken}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
 
-    if context.user_data is not None:
-        context.user_data['awaiting_password'] = True
+            url = f'https://api.github.com/gists/{gistid}'
+            payload = {
+                'files': {
+                    filename: {
+                        'content': json.dumps(data, indent=4, ensure_ascii=False)
+                    }
+                }
+            }
 
-    return False
+            response = requests.patch(url, headers=headers, json=payload)
 
+            if response.status_code == 200:
+                logger.info("Gist updated successfully")
+                return True
+            else:
+                logger.error(f"Failed to update gist: {response.status_code}")
+                return False
 
-# --- ГЛАВНОЕ МЕНЮ ---
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, info_msg: str = None):
-    """Показывает главное меню"""
-    lic_dict = await get_licenses_from_gist()
-    total = len(lic_dict) if lic_dict else 0
-    active = sum(1 for v in lic_dict.values() if v.get('hasActive')) if lic_dict else 0
-    demo = sum(1 for v in lic_dict.values() if v.get('customer') == 'demo') if lic_dict else 0
-    annulled = sum(1 for v in lic_dict.values() if
-                   not v.get('hasActive') and v.get('expired') == '' and v.get('customer') != 'demo') if lic_dict else 0
-
-    text = (
-        "<b>🌟 Админ-панель управления лицензиями 🌟</b>\n"
-        "<b>──────────────</b>\n"
-        f"Всего: <b>{total}</b> | 🟢 <b>{active}</b> | 🟡 <b>{demo}</b> | ⚫️ <b>{annulled}</b>\n"
-        "<b>──────────────</b>\n"
-        "Выберите действие:\n"
-    )
-
-    if info_msg:
-        text = f"{info_msg}\n\n{text}"
-
-    keyboard = [
-        [InlineKeyboardButton("📋 Список ключей", callback_data="key_list")],
-        [InlineKeyboardButton("🔍 Поиск по нику", callback_data="find_key")],
-        [InlineKeyboardButton("🔍 Поиск по ключу", callback_data="find_by_key")],
-        [InlineKeyboardButton("🔑 Сгенерировать ключ", callback_data="generate_key")],
-        [InlineKeyboardButton("📊 Экспорт/Импорт", callback_data="export_import_menu")],
-        [InlineKeyboardButton("🔄 Обновить данные из БД", callback_data="refresh_config")],
-        [InlineKeyboardButton("❓ Помощь / FAQ", callback_data="help_faq")]
-    ]
-
-    if update.message:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
-                                                      parse_mode='HTML')
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /start"""
-    if not await check_admin_auth(update, context):
-        return
-    await show_main_menu(update, context)
-
-
-# --- ОБНОВЛЕНИЕ КОНФИГА ---
-async def refresh_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принудительное обновление конфигурации из БД"""
-    await db.refresh()
-
-    github_token = await get_github_token()
-    gist_id = await get_gist_id()
-    gist_filename = await get_gist_filename()
-    admin_ids = await get_admin_ids()
-
-    text = (
-        "✅ Конфигурация обновлена из БД:\n\n"
-        f"🔑 GitHub токен: {github_token[:10] if github_token else 'Не задан'}...\n"
-        f"📦 Gist ID: {gist_id or 'Не задан'}\n"
-        f"📄 Gist файл: {gist_filename or 'licenses.json'}\n"
-        f"👤 Админы: {admin_ids}\n"
-    )
-
-    if update.callback_query:
-        await update.callback_query.answer("Конфигурация обновлена!")
-        await show_main_menu(update, context, text)
-    else:
-        await update.message.reply_text(text)
-
-
-# --- СПИСОК КЛЮЧЕЙ ---
-KEYS_PER_PAGE = 10
-
-
-async def key_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список ключей"""
-    if not await check_admin_auth(update, context):
-        return
-
-    lic_dict = await get_licenses_from_gist()
-    if not lic_dict or not isinstance(lic_dict, dict):
-        await show_main_menu(update, context, "Нет ключей.")
-        return
-
-    # Фильтры и сортировка
-    filter_val = context.user_data.get('keylist_filter', 'all')
-    sort_val = context.user_data.get('keylist_sort', 'created_desc')
-    bulk_mode = context.user_data.get('bulk_mode', False)
-    selected_keys = context.user_data.get('bulk_selected', [])
-
-    filtered = list(lic_dict.items())
-
-    # Применяем фильтры
-    if filter_val == 'active':
-        filtered = [(k, v) for k, v in filtered if v.get('hasActive')]
-    elif filter_val == 'demo':
-        filtered = [(k, v) for k, v in filtered if v.get('customer') == 'demo']
-    elif filter_val == 'annulled':
-        filtered = [(k, v) for k, v in filtered if
-                    not v.get('hasActive') and v.get('expired') == '' and v.get('customer') != 'demo']
-    elif filter_val == 'soon_expired':
-        now = datetime.now()
-
-        def is_soon(v):
-            exp = v.get('expired')
-            if exp and isinstance(exp, str):
-                try:
-                    exp_str = exp.split()[0] if len(exp) > 10 else exp
-                    if exp_str:
-                        exp_date = datetime.strptime(exp_str, "%d.%m.%Y")
-                        return 0 <= (exp_date - now).days <= 7
-                except Exception:
-                    pass
+        except Exception as e:
+            logger.error(f"Error updating gist: {e}")
             return False
 
-        filtered = [(k, v) for k, v in filtered if is_soon(v)]
-    elif filter_val == 'diskcheck_on':
-        filtered = [(k, v) for k, v in filtered if not v.get('disableDiskCheck', False)]
-    elif filter_val == 'diskcheck_off':
-        filtered = [(k, v) for k, v in filtered if v.get('disableDiskCheck', False)]
 
-    # Применяем сортировку
-    if sort_val == 'created_desc':
-        def parse_created(info):
+# Класс для работы с ключами
+class LicenseManager:
+    def __init__(self, db: LicenseBotDB):
+        self.db = db
+        self.keys_per_page = 10
+        self.cache = None
+
+    async def _refresh_cache(self):
+        """Обновляет кэш ключей"""
+        self.cache = await self.db.get_gist_data()
+
+    async def get_all_keys(self) -> List[Dict]:
+        """Получает все ключи из Gist"""
+        await self._refresh_cache()
+        if not self.cache:
+            return []
+
+        keys = []
+        for key, value in self.cache.items():
+            value['key'] = key  # Добавляем ключ в данные
+            keys.append(value)
+
+        return keys
+
+    async def get_keys_page(self, page: int = 1) -> Tuple[List[Dict], int, int]:
+        """Возвращает ключи для указанной страницы"""
+        all_keys = await self.get_all_keys()
+        total_keys = len(all_keys)
+        total_pages = (total_keys + self.keys_per_page - 1) // self.keys_per_page
+
+        start = (page - 1) * self.keys_per_page
+        end = start + self.keys_per_page
+
+        page_keys = all_keys[start:end]
+
+        return page_keys, page, total_pages
+
+    def get_status_emoji(self, key_data: Dict) -> str:
+        """Возвращает эмодзи статуса ключа"""
+        from datetime import datetime
+
+        # Сначала проверяем, истек ли ключ (даже если он активен)
+        expired = key_data.get('expired', 0)
+        if expired != 0 and isinstance(expired, str):
             try:
-                created_val = info.get('created', '')
-                return datetime.strptime(created_val, "%d.%m.%Y %H:%M") if created_val else datetime.min
-            except Exception:
-                return datetime.min
+                # Парсим дату истечения
+                expired_date = datetime.strptime(expired, "%d.%m.%Y")
+                current_date = datetime.now()
 
-        filtered.sort(key=lambda x: parse_created(x[1]), reverse=True)
-    elif sort_val == 'created_asc':
-        def parse_created(info):
-            try:
-                created_val = info.get('created', '')
-                return datetime.strptime(created_val, "%d.%m.%Y %H:%M") if created_val else datetime.min
-            except Exception:
-                return datetime.min
+                # Если дата истечения меньше текущей даты - ключ истек
+                if expired_date < current_date:
+                    return "🔴"  # Истек
+            except Exception as e:
+                logger.error(f"Error parsing expired date: {e}")
 
-        filtered.sort(key=lambda x: parse_created(x[1]))
-    elif sort_val == 'forever':
-        filtered = [(k, v) for k, v in filtered if v.get('period', 0) >= 3650]
-        filtered.sort(key=lambda x: x[1].get('created', ''), reverse=True)
-    elif sort_val == 'month':
-        filtered = [(k, v) for k, v in filtered if v.get('period', 0) == 30]
-        filtered.sort(key=lambda x: x[1].get('created', ''), reverse=True)
-    elif sort_val == 'week':
-        filtered = [(k, v) for k, v in filtered if v.get('period', 0) == 7]
-        filtered.sort(key=lambda x: x[1].get('created', ''), reverse=True)
-    elif sort_val == 'demo':
-        filtered = [(k, v) for k, v in filtered if 0 < v.get('period', 0) < 1]
-        filtered.sort(key=lambda x: x[1].get('created', ''), reverse=True)
+        # Если ключ активен и не истек
+        if key_data.get('hasActive'):
+            return "🟢"  # Активен
 
-    keys = [k for k, v in filtered]
+        # Во всех остальных случаях - желтый
+        return "🟡"  # Не активирован
 
-    # Пагинация
-    page = context.user_data.get('keylist_page', 0)
+    async def search_by_key(self, search_key: str) -> List[Dict]:
+        """Ищет ключ по точному совпадению"""
+        all_keys = await self.get_all_keys()
+        results = []
+        for key_data in all_keys:
+            if key_data['key'].lower() == search_key.lower():
+                results.append(key_data)
+                break
+        return results
 
-    if update.callback_query and getattr(update.callback_query, 'data', None):
-        cb_data = update.callback_query.data
-        if cb_data and isinstance(cb_data, str) and cb_data.startswith('keylist_page_'):
-            try:
-                page = int(cb_data.split('_')[-1])
-                context.user_data['keylist_page'] = page
-            except Exception:
-                page = 0
+    async def search_by_customer(self, customer_name: str) -> List[Dict]:
+        """Ищет ключи по имени пользователя (частичное совпадение)"""
+        all_keys = await self.get_all_keys()
+        results = []
+        customer_lower = customer_name.lower()
+        for key_data in all_keys:
+            customer = key_data.get('customer', '')
+            if customer and customer_lower in customer.lower():
+                results.append(key_data)
+        return results
 
-    total_pages = max(1, (len(keys) - 1) // KEYS_PER_PAGE + 1 if keys else 1)
-    start = page * KEYS_PER_PAGE
-    end = start + KEYS_PER_PAGE
-    page_keys = keys[start:end]
-
-    keyboard = []
-    for key in page_keys:
-        info = lic_dict[key]
-
-        # Статус эмодзи
-        if info.get('hasActive'):
-            emoji = '🟢'
-        elif info.get('customer') == 'demo':
-            emoji = '🟡'
-        elif not info.get('hasActive') and info.get('expired') == '':
-            emoji = '⚫️'
-        else:
-            emoji = '🔴'
-
-        if bulk_mode:
-            checked = '✅' if key in selected_keys else '⬜️'
-            button_text = f"{checked} {emoji} {key}"
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"bulk_toggle_{key}")])
-        else:
-            button_text = f"{emoji} {key} | {info.get('customer', '?')}"
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"edit_{key}")])
-
-    # Навигация
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"keylist_page_{page - 1}"))
-    if end < len(keys):
-        nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"keylist_page_{page + 1}"))
-
-    if nav_buttons:
-        keyboard.append(nav_buttons)
-
-    keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data=f"keylist_page_{page}")])
-    keyboard.append([InlineKeyboardButton("⚙️ Фильтр/Сортировка", callback_data="keylist_filter_menu")])
-
-    if bulk_mode:
-        keyboard.append([
-            InlineKeyboardButton("🗑️ Удалить выбранные", callback_data="bulk_confirm_delete"),
-            InlineKeyboardButton("🚫 Аннулировать выбранные", callback_data="bulk_confirm_annul")
-        ])
-        keyboard.append([InlineKeyboardButton("❌ Сбросить выбор", callback_data="bulk_cancel")])
-    else:
-        keyboard.append([InlineKeyboardButton("☑️ Массовый выбор", callback_data="bulk_mode_on")])
-
-    keyboard.append([InlineKeyboardButton("🗑️ Удалить все демо-ключи", callback_data="delete_demo_keys")])
-    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="main_menu")])
-
-    text = f"<b>📋 Список ключей</b> (стр. {page + 1}/{total_pages}):\nФильтр: <b>{filter_val}</b>"
-    if bulk_mode:
-        text += f"\n\nВыбрано: {len(selected_keys)} ключей"
-
-    if update.callback_query:
+    async def update_key_period(self, key: str, new_period: int) -> bool:
+        """Обновляет срок действия ключа с учетом его статуса"""
         try:
-            await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
-                                                          parse_mode='HTML')
+            await self._refresh_cache()
+            if not self.cache or key not in self.cache:
+                return False
+
+            key_data = self.cache[key]
+            old_period = key_data.get('period', 0)
+
+            # Обновляем period
+            key_data['period'] = new_period
+
+            # Если ключ активирован (issued не 0 и не пустой)
+            issued = key_data.get('issued', 0)
+            if issued != 0 and issued != "0" and issued:
+                from datetime import datetime, timedelta
+                try:
+                    # Парсим дату активации
+                    issued_date = datetime.strptime(issued, "%d.%m.%Y")
+                    # Вычисляем новую дату истечения
+                    expired_date = issued_date + timedelta(days=new_period)
+                    # Форматируем обратно в строку
+                    key_data['expired'] = expired_date.strftime("%d.%m.%Y")
+                except Exception as e:
+                    logger.error(f"Error calculating expired date: {e}")
+                    # Если ошибка парсинга, оставляем expired без изменений
+                    pass
+
+            # Сохраняем в Gist
+            return await self.db.update_gist_data(self.cache)
         except Exception as e:
-            if "Message is not modified" not in str(e):
-                raise
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+            logger.error(f"Error updating key period: {e}")
+            return False
 
-
-# --- МАССОВЫЕ ДЕЙСТВИЯ ---
-async def bulk_mode_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['bulk_mode'] = True
-    context.user_data['bulk_selected'] = []
-    await key_list(update, context)
-
-
-async def bulk_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['bulk_mode'] = False
-    context.user_data['bulk_selected'] = []
-    await key_list(update, context)
-
-
-async def bulk_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key = update.callback_query.data.split('_', 2)[2]
-    selected = context.user_data.get('bulk_selected', [])
-    if key in selected:
-        selected.remove(key)
-    else:
-        selected.append(key)
-    context.user_data['bulk_selected'] = selected
-    await key_list(update, context)
-
-
-async def bulk_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    selected = context.user_data.get('bulk_selected', [])
-    if not selected:
-        await key_list(update, context)
-        return
-    keyboard = [
-        [InlineKeyboardButton("✅ Да, удалить", callback_data="bulk_delete")],
-        [InlineKeyboardButton("❌ Нет, назад", callback_data="key_list")]
-    ]
-    text = f"⚠️ Удалить {len(selected)} выбранных ключей?"
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def bulk_confirm_annul(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    selected = context.user_data.get('bulk_selected', [])
-    if not selected:
-        await key_list(update, context)
-        return
-    keyboard = [
-        [InlineKeyboardButton("✅ Да, аннулировать", callback_data="bulk_annul")],
-        [InlineKeyboardButton("❌ Нет, назад", callback_data="key_list")]
-    ]
-    text = f"⚠️ Аннулировать {len(selected)} выбранных ключей?"
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def bulk_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    selected = context.user_data.get('bulk_selected', [])
-    lic_dict = await get_licenses_from_gist() or {}
-    for k in list(selected):
-        if k in lic_dict:
-            del lic_dict[k]
-    await save_licenses_to_gist(lic_dict)
-    context.user_data['bulk_mode'] = False
-    context.user_data['bulk_selected'] = []
-    await show_main_menu(update, context, f"🗑️ Удалено {len(selected)} ключей.")
-
-
-async def bulk_annul(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    selected = context.user_data.get('bulk_selected', [])
-    lic_dict = await get_licenses_from_gist() or {}
-    for k in list(selected):
-        if k in lic_dict and lic_dict[k].get('hasActive'):
-            lic_dict[k]['hasActive'] = False
-            lic_dict[k]['hwid'] = ""
-            lic_dict[k]['issued'] = ""
-            lic_dict[k]['expired'] = ""
-    await save_licenses_to_gist(lic_dict)
-    context.user_data['bulk_mode'] = False
-    context.user_data['bulk_selected'] = []
-    await show_main_menu(update, context, f"🚫 Аннулировано {len(selected)} ключей.")
-
-
-# --- ПОИСК ПО НИКУ ---
-async def find_key_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin_auth(update, context):
-        return
-    keyboard = [[InlineKeyboardButton("↩️ Назад", callback_data="main_menu")]]
-    text = "Введите ник для поиска (отправьте сообщением):"
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-    context.user_data['awaiting_nick'] = True
-
-
-async def find_by_key_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin_auth(update, context):
-        return
-    keyboard = [[InlineKeyboardButton("↩️ Назад", callback_data="main_menu")]]
-    text = "Введите ключ для поиска (отправьте сообщением):"
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-    context.user_data['awaiting_key'] = True
-
-
-# --- МЕНЮ РЕДАКТИРОВАНИЯ КЛЮЧА ---
-async def edit_key_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню редактирования ключа"""
-    query = update.callback_query
-    if not query or not hasattr(query, 'data') or query.data is None:
-        return
-
-    await query.answer()
-
-    user_id = query.from_user.id if query.from_user else None
-    admin_ids = await get_admin_ids()
-
-    if user_id not in admin_ids and not (context.user_data and context.user_data.get('admin_authenticated')):
-        await query.answer("🔒 Нет доступа", show_alert=True)
-        return
-
-    key = query.data.split('_', 1)[1] if query.data else None
-    lic_dict = await get_licenses_from_gist()
-
-    if not key or not lic_dict or key not in lic_dict or lic_dict[key] is None:
-        await query.answer("Ключ не найден!", show_alert=True)
-        return
-
-    info = lic_dict[key]
-
-    status = '🟢 Активен' if info.get('hasActive') else ('🟡 Демо' if info.get('customer') == 'demo' else '🔴 Неактивен')
-
-    text = (
-        f"<b>🔑 Ключ:</b> <code>{key}</code>\n"
-        f"<b>👤 Клиент:</b> <code>{info.get('customer', '?')}</code>\n"
-        f"<b>📅 Создан:</b> <code>{info.get('created', '?')}</code>\n"
-        f"<b>⏳ Истекает:</b> <code>{info.get('expired', '?')}</code>\n"
-        f"<b>📆 Срок:</b> <code>{info.get('period', '?')}</code> дней\n"
-        f"<b>💽 HWID:</b> <code>{info.get('hwid', '-')}</code>\n"
-        f"<b>Статус:</b> {status}\n"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("🗑️ Удалить", callback_data=f"confirm_delete_{key}"),
-         InlineKeyboardButton(
-             ("🔴 Отключить" if info.get('hasActive') else "🟢 Включить"),
-             callback_data=f"toggle_active_{key}")],
-        [InlineKeyboardButton("📅 Изменить дату", callback_data=f"setexp_{key}"),
-         InlineKeyboardButton("🔄 Изменить период", callback_data=f"setperiod_{key}")],
-        [InlineKeyboardButton(f"💽 Проверка диска: {'✅' if info.get('disableDiskCheck') else '❌'}",
-                              callback_data=f"diskcheck_{key}")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="main_menu")]
-    ]
-
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-# --- ПОДТВЕРЖДЕНИЯ ---
-async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    key = query.data.split('_', 2)[2] if query and hasattr(query, 'data') and query.data else None
-    keyboard = [
-        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"delete_{key}"),
-         InlineKeyboardButton("❌ Нет, назад", callback_data=f"edit_{key}")]
-    ]
-    if query:
-        await query.edit_message_text(
-            f"<b>⚠️ Вы уверены, что хотите удалить ключ</b> <code>{key}</code>?\nЭто действие <b>необратимо</b>!",
-            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-async def confirm_annul(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    key = query.data.split('_', 2)[2] if query and hasattr(query, 'data') and query.data else None
-    keyboard = [
-        [InlineKeyboardButton("✅ Да, аннулировать", callback_data=f"annul_{key}"),
-         InlineKeyboardButton("❌ Нет, назад", callback_data=f"edit_{key}")]
-    ]
-    if query:
-        await query.edit_message_text(
-            f"<b>⚠️ Вы уверены, что хотите аннулировать ключ</b> <code>{key}</code>?\nПосле аннуляции ключ станет неактивным.",
-            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-# --- УДАЛЕНИЕ КЛЮЧА ---
-async def delete_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    key = query.data.split('_', 1)[1] if query and hasattr(query, 'data') and query.data else None
-    lic_dict = await get_licenses_from_gist()
-
-    if not lic_dict or key not in lic_dict or lic_dict[key] is None:
-        await query.answer("Ключ не найден!", show_alert=True)
-        return
-
-    if key in lic_dict:
-        del lic_dict[key]
-        await save_licenses_to_gist(lic_dict)
-        await query.answer(f"🗑️ Ключ {key} удалён!", show_alert=True)
-        await show_main_menu(update, context, f"🗑️ Ключ <code>{key}</code> успешно удалён!")
-
-
-# --- АННУЛИРОВАНИЕ КЛЮЧА ---
-async def annul_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    key = query.data.split('_', 1)[1] if query and hasattr(query, 'data') and query.data else None
-    lic_dict = await get_licenses_from_gist()
-
-    if not lic_dict or key not in lic_dict or lic_dict[key] is None:
-        await query.answer("Ключ не найден!", show_alert=True)
-        return
-
-    lic_dict[key]['hasActive'] = False
-    lic_dict[key]['hwid'] = ""
-    lic_dict[key]['issued'] = ""
-    lic_dict[key]['expired'] = ""
-    await save_licenses_to_gist(lic_dict)
-    await query.answer(f"🚫 Ключ {key} аннулирован!", show_alert=True)
-    await show_main_menu(update, context, f"🚫 Ключ <code>{key}</code> аннулирован.")
-
-
-# --- АКТИВАЦИЯ КЛЮЧА ---
-async def activate_key(key, context):
-    """Активирует ключ и отправляет уведомление админам"""
-    lic_dict = await get_licenses_from_gist()
-    admin_ids = await get_admin_ids()
-
-    if not lic_dict or key not in lic_dict or lic_dict[key] is None:
-        return
-
-    info = lic_dict[key]
-    moscow_tz = pytz.timezone('Europe/Moscow')
-
-    if not info.get('issued') or info.get('issued') in (0, '', None):
-        now = datetime.now(moscow_tz)
-        period = info.get('period', 0)
+    async def update_key(self, key: str, updates: Dict) -> bool:
+        """Обновляет данные ключа и сохраняет в Gist"""
         try:
-            period = int(float(period))
-        except Exception:
-            period = 0
+            await self._refresh_cache()
+            if not self.cache or key not in self.cache:
+                return False
 
-        info['issued'] = now.strftime('%d.%m.%Y %H:%M')
-        if period > 0:
-            info['expired'] = (now + timedelta(days=period)).strftime('%d.%m.%Y %H:%M')
-        else:
-            info['expired'] = ''
+            # Обновляем данные
+            for field, value in updates.items():
+                self.cache[key][field] = value
 
-    info['hasActive'] = True
-    await save_licenses_to_gist(lic_dict)
+            # Сохраняем в Gist
+            return await self.db.update_gist_data(self.cache)
+        except Exception as e:
+            logger.error(f"Error updating key: {e}")
+            return False
 
-    # Отправка уведомлений админам
-    for admin_id in admin_ids:
+    async def delete_key(self, key: str) -> bool:
+        """Удаляет ключ из Gist"""
         try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=f"🔔 Ключ `{key}` был активирован!"
-            )
-        except Exception:
-            pass
-
-
-# --- ИЗМЕНЕНИЕ ДАТЫ И PERIOD ---
-async def set_expired(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    key = query.data.split('_', 1)[1] if query and hasattr(query, 'data') and query.data else None
-    context.user_data['edit_key'] = key
-    context.user_data['edit_field'] = 'expired'
-    keyboard = [[InlineKeyboardButton("↩️ Назад", callback_data=f"edit_{key}")]]
-    if query:
-        await query.edit_message_text(f"<b>Введите новую дату истечения (ДД.ММ.ГГГГ):</b>",
-                                      reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-async def set_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    key = query.data.split('_', 1)[1] if query and hasattr(query, 'data') and query.data else None
-    context.user_data['edit_key'] = key
-    context.user_data['edit_field'] = 'period'
-    keyboard = [[InlineKeyboardButton("↩️ Назад", callback_data=f"edit_{key}")]]
-    if query:
-        await query.edit_message_text(f"<b>Введите новый period (в днях):</b>",
-                                      reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-# --- DISK CHECK ---
-async def toggle_diskcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    key = query.data.split('_', 1)[1] if query and hasattr(query, 'data') and query.data else None
-    lic_dict = await get_licenses_from_gist()
-
-    if not lic_dict or key not in lic_dict or lic_dict[key] is None:
-        await query.answer("Ключ не найден!", show_alert=True)
-        return
-
-    lic_dict[key]['disableDiskCheck'] = not lic_dict[key].get('disableDiskCheck', False)
-    await save_licenses_to_gist(lic_dict)
-    await edit_key_menu(update, context)
-
-
-# --- ГЕНЕРАЦИЯ КЛЮЧА ---
-async def generate_key_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало генерации ключа"""
-    if not await check_admin_auth(update, context):
-        return
-
-    context.user_data['gen_step'] = 'customer'
-    keyboard = [[InlineKeyboardButton("↩️ Назад", callback_data="main_menu")]]
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text("Введите имя клиента:",
-                                                      reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await update.message.reply_text("Введите имя клиента:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def handle_generate_key_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ввода для генерации ключа"""
-    if not await check_admin_auth(update, context):
-        return
-
-    if context.user_data.get('gen_step') == 'customer':
-        customer = update.message.text.strip()
-        context.user_data['gen_customer'] = customer
-        context.user_data['gen_step'] = 'time'
-        keyboard = [
-            [InlineKeyboardButton("Неделя", callback_data="gen_time_week"),
-             InlineKeyboardButton("Месяц", callback_data="gen_time_month")],
-            [InlineKeyboardButton("Год", callback_data="gen_time_year"),
-             InlineKeyboardButton("Бессрочно", callback_data="gen_time_unlimited")],
-            [InlineKeyboardButton("Демо-ключ", callback_data="gen_time_demo")],
-            [InlineKeyboardButton("↩️ Назад", callback_data="main_menu")]
-        ]
-        await update.message.reply_text("Выберите срок действия:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    await handle_text_input(update, context)
-
-
-async def send_client_window(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
-    """Отправляет сообщение для клиента с ключом"""
-    text = (
-        f"Ваш ключ активации: <code>{key}</code>\n\n"
-        "Внимательно читайте инструкцию перед применением и не запускайте программы в архиве — сначала распакуйте.\n"
-        "Прежде чем задавать вопросы по работе программы, читайте инструкцию и проверяйте, всё ли вы правильно сделали.\n"
-        "\n"
-        "<b>ИНСТРУКЦИЯ ЕСТЬ В ОТПРАВЛЕННОМ ВАМ АРХИВЕ</b>"
-    )
-
-    if update.callback_query:
-        sent = await update.callback_query.message.reply_text(text, parse_mode='HTML')
-    else:
-        sent = await update.message.reply_text(text, parse_mode='HTML')
-
-    await asyncio.sleep(15)
-    try:
-        await sent.delete()
-    except Exception:
-        pass
-
-
-async def handle_generate_key_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора срока для ключа"""
-    if not await check_admin_auth(update, context):
-        return
-
-    query = update.callback_query
-    if not query or not hasattr(query, 'data') or not query.data.startswith('gen_time_'):
-        return
-
-    time_val = query.data.replace('gen_time_', '')
-    customer = context.user_data.get('gen_customer', 'unknown')
-
-    # Обновляем конфиг перед генерацией
-    await db.refresh()
-
-    generator = LicenseGenerator()
-    # Передаем токены в генератор
-    generator.GITHUB_TOKEN = await get_github_token()
-    generator.GIST_ID = await get_gist_id()
-    generator.LICENSE_FILE_IN_GIST = await get_gist_filename()
-
-    await asyncio.to_thread(generator.load_licenses)
-    license = generator.create_license(customer=customer, time=time_val)
-
-    if license and license.get('key'):
-        generator.valid_licenses[license['key']] = license
-        success = await asyncio.to_thread(generator.save_licenses)
-
-        if success:
-            logger.info(f"Создан ключ для клиента '{customer}': {license.get('key')}")
-            text = (
-                f"✅ *Ключ успешно сгенерирован!*\n\n"
-                f"🔹 *Клиент:* {license.get('customer', '?')}\n"
-                f"🔹 *Срок:* {license.get('period', '?')} дней\n"
-                f"🔹 *Дата генерации:* {license.get('created', '?')} (МСК)\n\n"
-                f"🔑 *Сгенерированный ключ:* `{license.get('key')}`"
-            )
-            keyboard = [
-                [InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_{license.get('key')}")],
-                [InlineKeyboardButton("📤 Показать окно для клиента",
-                                      callback_data=f"show_client_window_{license.get('key')}")],
-                [InlineKeyboardButton("↩️ В меню", callback_data="main_menu")]
-            ]
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        else:
-            await query.edit_message_text("❌ Ошибка сохранения ключа!", parse_mode='Markdown')
-    else:
-        await query.edit_message_text("❌ Ошибка генерации ключа!", parse_mode='Markdown')
-
-    context.user_data.pop('gen_step', None)
-    context.user_data.pop('gen_customer', None)
-
-
-# --- ДЕМО-КЛЮЧ ---
-async def create_demo_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Создание демо-ключа"""
-    if not await check_admin_auth(update, context):
-        return
-
-    await db.refresh()
-
-    generator = LicenseGenerator()
-    generator.GITHUB_TOKEN = await get_github_token()
-    generator.GIST_ID = await get_gist_id()
-    generator.LICENSE_FILE_IN_GIST = await get_gist_filename()
-
-    await asyncio.to_thread(generator.load_licenses)
-    license = generator.create_license(customer="demo", time="demo")
-
-    if license and 'key' in license:
-        key = license['key']
-        license['customer'] = 'demo'
-        license['disableDiskCheck'] = True
-        generator.valid_licenses[key] = license
-        success = await asyncio.to_thread(generator.save_licenses)
-
-        if success:
-            logger.info(f"Создан демо-ключ: {key}")
-            text = f"🆕 Демо-ключ создан: <code>{key}</code>\nДействует 10 минут.\n<i>Нажмите на ключ, чтобы скопировать</i>"
-            keyboard = [
-                [InlineKeyboardButton("📤 Показать окно для клиента", callback_data=f"show_client_window_{key}")],
-                [InlineKeyboardButton("↩️ В меню", callback_data="main_menu")]
-            ]
-            if update.callback_query:
-                await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
-                                                              parse_mode='HTML')
-            else:
-                await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-        else:
-            await show_main_menu(update, context, "❌ Ошибка сохранения демо-ключа!")
-    else:
-        await show_main_menu(update, context, "❌ Ошибка генерации демо-ключа!")
-
-
-# --- УДАЛЕНИЕ ВСЕХ ДЕМО-КЛЮЧЕЙ ---
-async def delete_demo_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Удаляет все демо-ключи"""
-    lic_dict = await get_licenses_from_gist() or {}
-    demo_keys = [k for k, v in lic_dict.items() if v and v.get('customer') == 'demo']
-
-    for k in demo_keys:
-        del lic_dict[k]
-
-    await save_licenses_to_gist(lic_dict)
-    await show_main_menu(update, context, f"🗑️ Удалено демо-ключей: {len(demo_keys)}")
-
-
-# --- ПОМОЩЬ ---
-async def help_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню помощи"""
-    if not await check_admin_auth(update, context):
-        return
-
-    text = (
-        "<b>❓ FAQ и помощь</b>\n\n"
-        "<b>🟢 Активный</b> — ключ действующий, привязан к клиенту.\n"
-        "<b>🟡 Демо</b> — тестовый ключ, действует 10 минут.\n"
-        "<b>⚫️ Аннулирован</b> — ключ был аннулирован и не может быть использован.\n"
-        "<b>🔴 Неактивен</b> — срок действия истёк или ключ не активирован.\n\n"
-        "<b>Основные действия:</b>\n"
-        "- <b>Список ключей</b>: фильтрация, сортировка, массовые действия.\n"
-        "- <b>Карточка ключа</b>: подробная информация, быстрые действия.\n"
-        "- <b>Массовые действия</b>: выделяйте несколько ключей для удаления/аннуляции.\n"
-        "- <b>Обновить данные из БД</b>: принудительное обновление конфигурации.\n\n"
-        "<b>Если возникли вопросы — обращайтесь к администратору.</b>"
-    )
-
-    keyboard = [[InlineKeyboardButton("↩️ В меню", callback_data="main_menu")]]
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
-                                                      parse_mode='HTML')
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-# --- МЕНЮ ФИЛЬТРОВ ---
-async def keylist_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню фильтров и сортировки"""
-    text = (
-        "<b>🏠 Главное меню</b> / <b>📋 Список ключей</b> / <b>⚙️ Фильтр/Сортировка</b>\n\n"
-        "Выберите категорию:"
-    )
-    keyboard = [
-        [InlineKeyboardButton("🔍 Фильтры", callback_data="filter_menu")],
-        [InlineKeyboardButton("📊 Сортировка", callback_data="sort_menu")],
-        [InlineKeyboardButton("📅 По сроку", callback_data="duration_menu")],
-        [InlineKeyboardButton("↩️ Назад", callback_data="key_list")]
-    ]
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
-                                                      parse_mode='HTML')
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-async def filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню фильтров"""
-    text = (
-        "<b>🏠 Главное меню</b> / <b>📋 Список ключей</b> / <b>⚙️ Фильтр/Сортировка</b> / <b>🔍 Фильтры</b>\n\n"
-        "Выберите фильтр:"
-    )
-    keyboard = [
-        [InlineKeyboardButton("Все", callback_data="set_filter_all"),
-         InlineKeyboardButton("Активные", callback_data="set_filter_active")],
-        [InlineKeyboardButton("Демо", callback_data="set_filter_demo"),
-         InlineKeyboardButton("Аннулированные", callback_data="set_filter_annulled")],
-        [InlineKeyboardButton("Истекают (7д)", callback_data="set_filter_soon_expired")],
-        [InlineKeyboardButton("Проверка диска: ВКЛ", callback_data="set_filter_diskcheck_on"),
-         InlineKeyboardButton("Проверка диска: ВЫКЛ", callback_data="set_filter_diskcheck_off")],
-        [InlineKeyboardButton("↩️ Назад", callback_data="keylist_filter_menu")]
-    ]
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
-                                                      parse_mode='HTML')
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-async def sort_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню сортировки"""
-    text = (
-        "<b>🏠 Главное меню</b> / <b>📋 Список ключей</b> / <b>⚙️ Фильтр/Сортировка</b> / <b>📊 Сортировка</b>\n\n"
-        "Выберите сортировку:"
-    )
-    keyboard = [
-        [InlineKeyboardButton("По созданию ⬇️", callback_data="set_sort_created_desc"),
-         InlineKeyboardButton("По созданию ⬆️", callback_data="set_sort_created_asc")],
-        [InlineKeyboardButton("По истечению ⬇️", callback_data="set_sort_expired_desc"),
-         InlineKeyboardButton("По истечению ⬆️", callback_data="set_sort_expired_asc")],
-        [InlineKeyboardButton("По клиенту ⬇️", callback_data="set_sort_customer_desc"),
-         InlineKeyboardButton("По клиенту ⬆️", callback_data="set_sort_customer_asc")],
-        [InlineKeyboardButton("↩️ Назад", callback_data="keylist_filter_menu")]
-    ]
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
-                                                      parse_mode='HTML')
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-async def duration_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню выбора по сроку"""
-    text = (
-        "<b>🏠 Главное меню</b> / <b>📋 Список ключей</b> / <b>⚙️ Фильтр/Сортировка</b> / <b>📅 По сроку</b>\n\n"
-        "Выберите срок действия:"
-    )
-    keyboard = [
-        [InlineKeyboardButton("Все периоды", callback_data="set_duration_all")],
-        [InlineKeyboardButton("🔑 Навсегда", callback_data="set_sort_forever"),
-         InlineKeyboardButton("📅 Месяц", callback_data="set_sort_month")],
-        [InlineKeyboardButton("📆 Неделя", callback_data="set_sort_week"),
-         InlineKeyboardButton("🎯 Демо", callback_data="set_sort_demo")],
-        [InlineKeyboardButton("↩️ Назад", callback_data="keylist_filter_menu")]
-    ]
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
-                                                      parse_mode='HTML')
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-# --- ЭКСПОРТ/ИМПОРТ ---
-async def export_import_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню экспорта/импорта"""
-    if not await check_admin_auth(update, context):
-        return
-
-    text = (
-        "<b>🏠 Главное меню</b> / <b>📊 Экспорт/Импорт</b>\n\n"
-        "Выберите действие:"
-    )
-    keyboard = [
-        [InlineKeyboardButton("📤 Экспорт в CSV", callback_data="export_csv")],
-        [InlineKeyboardButton("📥 Импорт из CSV", callback_data="import_csv")],
-        [InlineKeyboardButton("↩️ Назад", callback_data="main_menu")]
-    ]
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
-                                                      parse_mode='HTML')
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экспорт в CSV"""
-    if not await check_admin_auth(update, context):
-        return
-
-    lic_dict = await get_licenses_from_gist()
-    if not lic_dict:
-        await show_main_menu(update, context, "Нет данных для экспорта.")
-        return
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-
-    writer.writerow([
-        'Ключ', 'Клиент', 'Создан', 'Истекает', 'Период (дней)',
-        'Статус', 'HWID', 'Примечания'
-    ])
-
-    now = datetime.now()
-
-    for key, info in lic_dict.items():
-        if not info:
+            await self._refresh_cache()
+            if not self.cache or key not in self.cache:
+                return False
+
+            # Удаляем ключ
+            del self.cache[key]
+
+            # Сохраняем в Gist
+            return await self.db.update_gist_data(self.cache)
+        except Exception as e:
+            logger.error(f"Error deleting key: {e}")
+            return False
+
+
+# Создаем экземпляры
+db = LicenseBotDB()
+session_manager = SessionManager(duration_minutes=SESSION_DURATION)
+license_manager = LicenseManager(db)
+
+
+# Функция для парсинга и форматирования вывода генератора
+def parse_generator_output(output: str) -> str:
+    """Извлекает только нужные строки из вывода генератора и форматирует для Telegram"""
+    lines = output.strip().split('\n')
+    result_lines = []
+
+    for line in lines:
+        # Пропускаем debug строки
+        if '[DEBUG]' in line:
             continue
 
-        expired_str = info.get('expired', '')
-        expired = None
-        if expired_str and isinstance(expired_str, str):
-            try:
-                exp_str = expired_str.split()[0] if len(expired_str) > 10 else expired_str
-                if exp_str:
-                    expired = datetime.strptime(exp_str, "%d.%m.%Y")
-            except Exception:
-                expired = None
+        # Форматируем каждую строку
+        line = line.strip()
+        if 'Сгенерированный ключ:' in line:
+            key = line.split('Сгенерированный ключ:')[1].strip()
+            result_lines.append(f"🔑 *Сгенерированный ключ:* `{key}`")
+        elif 'Покупатель:' in line:
+            customer = line.split('Покупатель:')[1].strip()
+            result_lines.append(f"👤 *Покупатель:* {customer}")
+        elif 'Срок действия:' in line:
+            period = line.split('Срок действия:')[1].strip()
+            result_lines.append(f"⏰ *Срок действия:* {period}")
+        elif 'Время генерации:' in line:
+            created = line.split('Время генерации:')[1].strip()
+            result_lines.append(f"✅ *Время генерации:* {created}")
 
-        if info.get('hasActive'):
-            status = 'Активен'
-        elif info.get('customer') == 'demo':
-            status = 'Демо'
-        elif not info.get('hasActive') and info.get('expired') == '':
-            status = 'Аннулирован'
-        elif expired and expired < now:
-            status = 'Истек'
+    return '\n'.join(result_lines) if result_lines else output
+
+
+# Функция запуска генератора
+def run_generator(customer: str, period: str) -> str:
+    """Запускает cmdGen.py и возвращает отформатированный вывод"""
+    try:
+        # Экранируем кавычки в имени пользователя
+        safe_customer = customer.replace('"', '\\"')
+        cmd = f'python cmdGen.py -c "{safe_customer}" -t {period}'
+        logger.info(f"Running: {cmd}")
+
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            encoding='utf-8'
+        )
+
+        if result.returncode == 0:
+            # Парсим вывод
+            return parse_generator_output(result.stdout)
         else:
-            status = 'Неактивен'
+            return f"Ошибка: {result.stderr}"
+    except Exception as e:
+        return f"Ошибка: {str(e)}"
 
-        period = info.get('period', 0)
-        notes = ""
-        if info.get('customer') == 'demo':
-            notes = "Демо-ключ"
-        elif period >= 3650:
-            notes = "Навсегда"
-        elif period == 30:
-            notes = "Месяц"
-        elif period == 7:
-            notes = "Неделя"
 
-        writer.writerow([
-            key,
-            info.get('customer', ''),
-            info.get('created', ''),
-            info.get('expired', ''),
-            period,
-            status,
-            info.get('hwid', ''),
-            notes
-        ])
+# Клавиатуры
+def get_main_keyboard():
+    """Главное меню в 2 столбца"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="📋 Список ключей", callback_data="list"),
+        InlineKeyboardButton(text="🔍 Поиск по ключу", callback_data="search_key"),
+        width=2
+    )
+    builder.row(
+        InlineKeyboardButton(text="👤 Поиск по пользователю", callback_data="search_user"),
+        InlineKeyboardButton(text="➕ Генерация ключа", callback_data="generate"),
+        width=2
+    )
+    builder.row(
+        InlineKeyboardButton(text="❓ FAQ", callback_data="faq"),
+        InlineKeyboardButton(text="🚪 Выйти", callback_data="logout"),
+        width=2
+    )
+    return builder.as_markup()
 
-    csv_content = output.getvalue()
-    output.close()
 
-    csv_file = io.BytesIO(csv_content.encode('utf-8-sig'))
-    csv_file.name = f'licenses_backup_{datetime.now().strftime("%Y%m%d_%H%M")}.csv'
+def get_period_keyboard():
+    """Клавиатура выбора периода в 2 столбца"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="📅 Неделя", callback_data="period:week"),
+        InlineKeyboardButton(text="📅 Месяц", callback_data="period:month"),
+        width=2
+    )
+    builder.row(
+        InlineKeyboardButton(text="📅 Год", callback_data="period:year"),
+        InlineKeyboardButton(text="♾️ Бессрочно", callback_data="period:unlimited"),
+        width=2
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔙 Отмена", callback_data="back"),
+        width=1
+    )
+    return builder.as_markup()
 
-    text = f"📊 Бэкап завершен!\n\nВсего ключей: {len(lic_dict)}"
 
-    if update.callback_query:
-        await update.callback_query.message.reply_document(
-            document=csv_file,
-            caption=text,
-            filename=csv_file.name
-        )
-        await update.callback_query.answer("Файл отправлен!")
+def get_back_keyboard():
+    """Кнопка назад"""
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="back"))
+    return builder.as_markup()
+
+
+def get_to_main_keyboard():
+    """Кнопка возврата в главное меню"""
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🏠 В главное меню", callback_data="back"))
+    return builder.as_markup()
+
+
+def get_keys_list_keyboard(page_keys: List[Dict], current_page: int, total_pages: int, search_mode: bool = False,
+                           search_query: str = ""):
+    """Клавиатура для списка ключей с пагинацией"""
+    builder = InlineKeyboardBuilder()
+
+    # Добавляем кнопки ключей (по одной в ряд)
+    for key_data in page_keys:
+        key = key_data['key']
+        status_emoji = license_manager.get_status_emoji(key_data)
+        button_text = f"{status_emoji} {key}"
+        builder.row(InlineKeyboardButton(text=button_text, callback_data=f"key:{key}"))
+
+    # Кнопки пагинации (всегда 3 кнопки в ряд)
+    pagination_buttons = []
+
+    # Левая кнопка (назад)
+    if current_page > 1:
+        if search_mode:
+            pagination_buttons.append(
+                InlineKeyboardButton(text="🔙", callback_data=f"search_page:{search_query}:{current_page - 1}"))
+        else:
+            pagination_buttons.append(InlineKeyboardButton(text="🔙", callback_data=f"page:{current_page - 1}"))
     else:
-        await update.message.reply_document(
-            document=csv_file,
-            caption=text,
-            filename=csv_file.name
-        )
+        pagination_buttons.append(InlineKeyboardButton(text="✖️", callback_data="noop"))
+
+    # Средняя кнопка (домой)
+    pagination_buttons.append(InlineKeyboardButton(text="🏠", callback_data="back"))
+
+    # Правая кнопка (вперед)
+    if current_page < total_pages:
+        if search_mode:
+            pagination_buttons.append(
+                InlineKeyboardButton(text="🔜", callback_data=f"search_page:{search_query}:{current_page + 1}"))
+        else:
+            pagination_buttons.append(InlineKeyboardButton(text="🔜", callback_data=f"page:{current_page + 1}"))
+    else:
+        pagination_buttons.append(InlineKeyboardButton(text="✖️", callback_data="noop"))
+
+    builder.row(*pagination_buttons, width=3)
+
+    return builder.as_markup()
 
 
-async def import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Импорт из CSV"""
-    if not await check_admin_auth(update, context):
-        return
+def get_key_details_keyboard(key: str):
+    """Клавиатура для детальной информации о ключе"""
+    builder = InlineKeyboardBuilder()
 
-    keyboard = [[InlineKeyboardButton("↩️ Назад", callback_data="export_import_menu")]]
-    text = (
-        "📥 <b>Импорт из CSV</b>\n\n"
-        "Отправьте CSV файл с лицензиями.\n"
-        "Формат: ключ,клиент,создан,истекает,период,статус,hwid\n\n"
-        "⚠️ Внимание: существующие ключи будут перезаписаны!"
+    # Кнопки действий
+    builder.row(
+        InlineKeyboardButton(text="📅 Изменить срок", callback_data=f"edit:period:{key}"),
+        InlineKeyboardButton(text="🧹 Удалить HWID", callback_data=f"edit:clear_hwid:{key}"),
+        width=2
+    )
+    builder.row(
+        InlineKeyboardButton(text="💾 Диск: переключить", callback_data=f"edit:toggle_disk:{key}"),
+        InlineKeyboardButton(text="🔴 Деактивировать", callback_data=f"edit:deactivate:{key}"),
+        width=2
+    )
+    builder.row(
+        InlineKeyboardButton(text="👤 Изменить имя", callback_data=f"edit:customer:{key}"),
+        InlineKeyboardButton(text="🗑️ Удалить ключ", callback_data=f"edit:delete:{key}"),
+        width=2
     )
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
-                                                      parse_mode='HTML')
+    # Кнопки навигации (7 строка, в два столбца)
+    builder.row(
+        InlineKeyboardButton(text="📋 К списку", callback_data="list"),
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="back"),
+        width=2
+    )
+
+    return builder.as_markup()
+
+
+def get_confirm_delete_keyboard(key: str):
+    """Клавиатура подтверждения удаления"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete:{key}"),
+        width=1
+    )
+    builder.row(
+        InlineKeyboardButton(text="❌ Нет, отмена", callback_data=f"key:{key}"),
+        width=1
+    )
+    return builder.as_markup()
+
+
+# Проверка сессии
+async def check_session(user_id: int) -> bool:
+    return session_manager.is_session_valid(user_id)
+
+
+# Старт
+@dp.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    name = message.from_user.first_name
+
+    session_manager.end_session(user_id)
+    await state.clear()
+
+    if await db.is_admin_by_id(user_id):
+        session_manager.create_session(user_id)
+        await message.answer(
+            f"👋 *Добро пожаловать, {name}!*\n✅ Вы вошли как администратор.\n\n📋 *Выберите действие:*",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
+        )
     else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-    context.user_data['awaiting_csv_import'] = True
+        await message.answer("🔐 Для доступа к боту введите пароль администратора:")
 
 
-async def handle_csv_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка импорта CSV"""
-    if not context.user_data or not context.user_data.get('awaiting_csv_import'):
-        return
+# Ввод пароля и обработка текстовых сообщений
+@dp.message()
+async def handle_text(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    text = message.text
 
-    if not update.message or not update.message.document:
-        await update.message.reply_text("❌ Пожалуйста, отправьте CSV файл.")
-        return
+    # Проверяем состояние FSM для редактирования
+    current_state = await state.get_state()
 
-    try:
-        file = await context.bot.get_file(update.message.document.file_id)
-        file_content = await file.download_as_bytearray()
-        content = file_content.decode('utf-8')
+    # Редактирование периода
+    if current_state == EditStates.waiting_for_period:
+        if user_id in edit_data:
+            key = edit_data[user_id]['key']
+            try:
+                days = int(text)
 
-        reader = csv.reader(io.StringIO(content))
-        next(reader)  # Пропускаем заголовки
+                # Используем специальный метод для обновления периода
+                if await license_manager.update_key_period(key, days):
+                    await message.answer(
+                        f"✅ *Срок действия ключа обновлен на {days} дней*",
+                        parse_mode="Markdown"
+                    )
+                    # Показываем обновленную информацию о ключе
+                    await show_key_details_direct(message, key)
+                else:
+                    await message.answer("❌ Ошибка при обновлении ключа")
 
-        lic_dict = await get_licenses_from_gist() or {}
-        imported_count = 0
+                # Очищаем данные
+                del edit_data[user_id]
+                await state.clear()
+                return
+            except ValueError:
+                await message.answer("❌ Введите число (количество дней)")
+                return
 
-        for row in reader:
-            if len(row) >= 7:
-                key, customer, created, expired, period, status, hwid = row[:7]
+    # Редактирование имени пользователя
+    elif current_state == EditStates.waiting_for_customer:
+        if user_id in edit_data:
+            key = edit_data[user_id]['key']
 
-                license_data = {
-                    "key": key,
-                    "customer": customer,
-                    "created": created,
-                    "expired": expired,
-                    "period": float(period) if period else 0,
-                    "hwid": hwid,
-                    "hasActive": status.lower() == 'активен',
-                    "disableDiskCheck": True
-                }
+            # Обновляем имя пользователя
+            updates = {'customer': text}
+            if await license_manager.update_key(key, updates):
+                await message.answer(
+                    f"✅ *Имя пользователя изменено на:* {text}",
+                    parse_mode="Markdown"
+                )
+                # Показываем обновленную информацию о ключе
+                await show_key_details_direct(message, key)
+            else:
+                await message.answer("❌ Ошибка при обновлении имени")
 
-                lic_dict[key] = license_data
-                imported_count += 1
-
-        if await save_licenses_to_gist(lic_dict):
-            await show_main_menu(update, context, f"✅ Импортировано {imported_count} лицензий!")
-        else:
-            await show_main_menu(update, context, "❌ Ошибка сохранения!")
-
-    except Exception as e:
-        await show_main_menu(update, context, f"❌ Ошибка импорта: {str(e)}")
-
-    context.user_data['awaiting_csv_import'] = False
-
-
-# --- ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ---
-async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Основной обработчик текстовых сообщений"""
-
-    # Поиск по нику
-    if context.user_data and context.user_data.get('awaiting_nick'):
-        search_nick = update.message.text.strip().lower()
-        lic_dict = await get_licenses_from_gist()
-        found = [(k, v) for k, v in lic_dict.items() if v and v.get('customer', '').lower() == search_nick]
-        context.user_data['awaiting_nick'] = False
-
-        if len(found) == 1:
-            dummy_update = types.SimpleNamespace()
-            dummy_update.callback_query = DummyQuery(f"edit_{found[0][0]}", update.effective_user, update.message,
-                                                     update.effective_chat.id)
-            await edit_key_menu(dummy_update, context)
-        elif found:
-            keyboard = []
-            for k, v in found:
-                keyboard.append([InlineKeyboardButton(f"✏️ Редактировать {k}", callback_data=f"edit_{k}")])
-            keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="main_menu")])
-            await update.message.reply_text("Найденные ключи:", reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await update.message.reply_text("Ключи не найдены.")
-        return
-
-    # Поиск по ключу
-    elif context.user_data and context.user_data.get('awaiting_key'):
-        search_key = update.message.text.strip()
-        lic_dict = await get_licenses_from_gist()
-        found = [(k, v) for k, v in lic_dict.items() if k == search_key]
-        context.user_data['awaiting_key'] = False
-
-        if len(found) == 1:
-            dummy_update = types.SimpleNamespace()
-            dummy_update.callback_query = DummyQuery(f"edit_{found[0][0]}", update.effective_user, update.message,
-                                                     update.effective_chat.id)
-            await edit_key_menu(dummy_update, context)
-        elif found:
-            keyboard = []
-            for k, v in found:
-                keyboard.append([InlineKeyboardButton(f"✏️ Редактировать {k}", callback_data=f"edit_{k}")])
-            keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="main_menu")])
-            await update.message.reply_text("Найденный ключ:", reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await update.message.reply_text("Ключ не найден.")
-        return
-
-    # Импорт CSV
-    elif context.user_data and context.user_data.get('awaiting_csv_import'):
-        await handle_csv_import(update, context)
-        return
-
-    # Изменение даты/period
-    if context.user_data and 'edit_key' in context.user_data and 'edit_field' in context.user_data:
-        key = context.user_data['edit_key']
-        field = context.user_data['edit_field']
-        value = update.message.text.strip()
-        lic_dict = await get_licenses_from_gist()
-
-        if key in lic_dict and lic_dict[key] is not None:
-            if field == 'expired':
-                try:
-                    datetime.strptime(value, "%d.%m.%Y")
-                    lic_dict[key]['expired'] = value
-
-                    issued_str = lic_dict[key].get('issued')
-                    if issued_str:
-                        try:
-                            issued_date = datetime.strptime(issued_str, "%d.%m.%Y")
-                            expired_date = datetime.strptime(value, "%d.%m.%Y")
-                            lic_dict[key]['period'] = (expired_date - issued_date).days
-                        except Exception:
-                            pass
-
-                except ValueError:
-                    await update.message.reply_text("❌ Неверный формат даты!")
-                    return
-
-            elif field == 'period':
-                try:
-                    period = int(value)
-                    lic_dict[key]['period'] = period
-
-                    issued_str = lic_dict[key].get('issued')
-                    if issued_str:
-                        try:
-                            issued_date = datetime.strptime(issued_str, "%d.%m.%Y")
-                            expired_date = issued_date + timedelta(days=period)
-                            lic_dict[key]['expired'] = expired_date.strftime("%d.%m.%Y")
-                        except Exception:
-                            pass
-
-                except ValueError:
-                    await update.message.reply_text("❌ Неверный формат числа!")
-                    return
-
-            await save_licenses_to_gist(lic_dict)
-            await update.message.reply_text(f"✅ Параметр {field} обновлён для ключа <code>{key}</code>!",
-                                            parse_mode='HTML')
-
-            context.user_data.pop('edit_key', None)
-            context.user_data.pop('edit_field', None)
-            await show_main_menu(update, context)
+            # Очищаем данные
+            del edit_data[user_id]
+            await state.clear()
             return
 
-    # Проверка пароля
-    await check_admin_auth(update, context)
+    # Поиск по ключу
+    elif current_state == EditStates.waiting_for_search_key:
+        results = await license_manager.search_by_key(text)
+        await state.clear()
+
+        if not results:
+            await message.answer(
+                f"🔍 *Результаты поиска по ключу*\n\n❌ Ключ `{text}` не найден",
+                reply_markup=get_back_keyboard(),
+                parse_mode="Markdown"
+            )
+            return  # <-- ВАЖНО: добавляем return
+
+        # Показываем результаты поиска
+        await show_search_results(message, results, "ключу", text)
+        return  # <-- ВАЖНО: добавляем return
+
+    # Поиск по пользователю
+    elif current_state == EditStates.waiting_for_search_user:
+        results = await license_manager.search_by_customer(text)
+        await state.clear()
+
+        if not results:
+            await message.answer(
+                f"👤 *Результаты поиска по пользователю*\n\n❌ Пользователь `{text}` не найден",
+                reply_markup=get_back_keyboard(),
+                parse_mode="Markdown"
+            )
+            return  # <-- ВАЖНО: добавляем return
+
+        # Показываем результаты поиска
+        await show_search_results(message, results, "пользователю", text)
+        return  # <-- ВАЖНО: добавляем return
+
+    # Проверяем состояние пользователя для генерации
+    elif user_id in user_states:
+        state_data = user_states[user_id]
+
+        if state_data['state'] == 'waiting_customer':
+            # Сохраняем имя покупателя
+            user_states[user_id]['customer'] = text
+            user_states[user_id]['state'] = 'waiting_period'
+            await message.answer(
+                f"👤 *Покупатель:* {text}\n\nВыберите срок действия:",
+                reply_markup=get_period_keyboard(),
+                parse_mode="Markdown"
+            )
+            return  # <-- ВАЖНО: добавляем return
+
+    # Если нет состояния - проверяем пароль
+    if await db.check_password(text):
+        session_manager.create_session(user_id)
+        await message.answer(
+            f"👋 *Добро пожаловать!*\n🔑 Вы вошли по паролю.\n\n📋 *Выберите действие:*",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer("❌ Неверный пароль. Попробуйте снова или используйте /start")
 
 
-# --- CALLBACK ROUTER ---
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Роутер для callback запросов"""
-    query = update.callback_query
-    data = query.data if query and hasattr(query, 'data') and query.data else None
+# Обработка кнопок
+@dp.callback_query()
+async def handle_callback(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    data = callback.data
 
-    if not data:
+    # Проверка сессии для всех действий
+    if not await check_session(user_id):
+        await callback.message.edit_text(
+            "⏰ *Сессия истекла*\n\nИспользуйте /start для нового входа.",
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+
+    session_manager.refresh_session(user_id)
+
+    # Заглушка для неактивных кнопок
+    if data == "noop":
+        await callback.answer("❌ Нет доступных страниц")
         return
 
     # Главное меню
-    if data == "main_menu":
-        await show_main_menu(update, context)
+    if data == "back":
+        if user_id in user_states:
+            del user_states[user_id]
+        if user_id in user_pages:
+            del user_pages[user_id]
+        if user_id in edit_data:
+            del edit_data[user_id]
+        await state.clear()
+        await callback.message.edit_text(
+            "📋 *Главное меню*\n\nВыберите действие:",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+
+    # Выход
+    if data == "logout":
+        session_manager.end_session(user_id)
+        if user_id in user_states:
+            del user_states[user_id]
+        if user_id in user_pages:
+            del user_pages[user_id]
+        if user_id in edit_data:
+            del edit_data[user_id]
+        await state.clear()
+        await callback.message.edit_text(
+            "👋 Вы вышли из системы.\nДля нового входа используйте /start"
+        )
+        await callback.answer()
+        return
 
     # Список ключей
-    elif data == "key_list" or (data and data.startswith("keylist_page_")):
-        await key_list(update, context)
+    if data == "list":
+        await show_keys_page(callback, user_id, 1)
+        return
 
-    # Поиск
-    elif data == "find_key":
-        await find_key_prompt(update, context)
-    elif data == "find_by_key":
-        await find_by_key_prompt(update, context)
+    # Пагинация для обычного списка
+    if data.startswith("page:"):
+        page = int(data.split(":")[1])
+        await show_keys_page(callback, user_id, page)
+        return
 
-    # Генерация ключа
-    elif data == "generate_key":
-        await generate_key_start(update, context)
-    elif data and data.startswith("gen_time_"):
-        await handle_generate_key_time(update, context)
-    elif data and data.startswith("show_client_window_"):
-        key = data.replace("show_client_window_", "")
-        await send_client_window(update, context, key)
+    # Пагинация для результатов поиска
+    if data.startswith("search_page:"):
+        parts = data.split(":")
+        search_query = parts[1]
+        page = int(parts[2])
+
+        # Определяем тип поиска (по ключу или по пользователю)
+        results = await license_manager.search_by_customer(search_query)
+        if not results:
+            results = await license_manager.search_by_key(search_query)
+
+        if results:
+            await show_search_results_page(callback, results, page, search_query)
+        else:
+            await callback.message.edit_text(
+                "❌ Результаты не найдены",
+                reply_markup=get_back_keyboard()
+            )
+        await callback.answer()
+        return
+
+    # Просмотр ключа
+    if data.startswith("key:"):
+        key = data.split(":")[1]
+        await show_key_details(callback, key)
+        return
 
     # Редактирование ключа
-    elif data and data.startswith("edit_"):
-        await edit_key_menu(update, context)
-    elif data and data.startswith("confirm_delete_"):
-        await confirm_delete(update, context)
-    elif data and data.startswith("delete_"):
-        await delete_key(update, context)
-    elif data and data.startswith("confirm_annul_"):
-        await confirm_annul(update, context)
-    elif data and data.startswith("annul_"):
-        await annul_key(update, context)
-    elif data and data.startswith("setexp_"):
-        await set_expired(update, context)
-    elif data and data.startswith("setperiod_"):
-        await set_period(update, context)
-    elif data and data.startswith("diskcheck_"):
-        await toggle_diskcheck(update, context)
-    elif data and data.startswith("toggle_active_"):
-        await toggle_active_license(update, context)
+    if data.startswith("edit:"):
+        parts = data.split(":")
+        action = parts[1]
+        key = parts[2]
 
-    # Фильтры и сортировка
-    elif data == "keylist_filter_menu":
-        await keylist_filter_menu(update, context)
-    elif data == "filter_menu":
-        await filter_menu(update, context)
-    elif data == "sort_menu":
-        await sort_menu(update, context)
-    elif data == "duration_menu":
-        await duration_menu(update, context)
+        # Изменение срока действия
+        if action == "period":
+            edit_data[user_id] = {'key': key, 'action': 'period'}
+            await state.set_state(EditStates.waiting_for_period)
 
-    # Установка фильтров
-    elif data == "set_filter_all":
-        context.user_data['keylist_filter'] = 'all'
-        await key_list(update, context)
-    elif data == "set_filter_active":
-        context.user_data['keylist_filter'] = 'active'
-        await key_list(update, context)
-    elif data == "set_filter_demo":
-        context.user_data['keylist_filter'] = 'demo'
-        await key_list(update, context)
-    elif data == "set_filter_annulled":
-        context.user_data['keylist_filter'] = 'annulled'
-        await key_list(update, context)
-    elif data == "set_filter_soon_expired":
-        context.user_data['keylist_filter'] = 'soon_expired'
-        await key_list(update, context)
-    elif data == "set_filter_diskcheck_on":
-        context.user_data['keylist_filter'] = 'diskcheck_on'
-        await key_list(update, context)
-    elif data == "set_filter_diskcheck_off":
-        context.user_data['keylist_filter'] = 'diskcheck_off'
-        await key_list(update, context)
+            # Получаем текущие данные ключа для информации
+            all_keys = await license_manager.get_all_keys()
+            key_data = None
+            for k in all_keys:
+                if k['key'] == key:
+                    key_data = k
+                    break
 
-    # Установка сортировки
-    elif data == "set_sort_created_desc":
-        context.user_data['keylist_sort'] = 'created_desc'
-        await key_list(update, context)
-    elif data == "set_sort_created_asc":
-        context.user_data['keylist_sort'] = 'created_asc'
-        await key_list(update, context)
-    elif data == "set_sort_forever":
-        context.user_data['keylist_sort'] = 'forever'
-        await key_list(update, context)
-    elif data == "set_sort_month":
-        context.user_data['keylist_sort'] = 'month'
-        await key_list(update, context)
-    elif data == "set_sort_week":
-        context.user_data['keylist_sort'] = 'week'
-        await key_list(update, context)
-    elif data == "set_sort_demo":
-        context.user_data['keylist_sort'] = 'demo'
-        await key_list(update, context)
-    elif data == "set_duration_all":
-        context.user_data['keylist_sort'] = 'created_desc'
-        await key_list(update, context)
+            status_info = ""
+            if key_data:
+                if key_data.get('issued') and key_data.get('issued') != 0 and key_data.get('issued') != "0":
+                    status_info = f"\n\n🔔 *Ключ активирован* {key_data.get('issued')}\nПри изменении срока expired будет пересчитан автоматически."
+                else:
+                    status_info = "\n\n⚪ *Ключ не активирован*\nБудет изменен только период."
 
-    # Массовые действия
-    elif data == "bulk_mode_on":
-        await bulk_mode_on(update, context)
-    elif data and data.startswith("bulk_toggle_"):
-        await bulk_toggle(update, context)
-    elif data == "bulk_cancel":
-        await bulk_cancel(update, context)
-    elif data == "bulk_confirm_delete":
-        await bulk_confirm_delete(update, context)
-    elif data == "bulk_confirm_annul":
-        await bulk_confirm_annul(update, context)
-    elif data == "bulk_delete":
-        await bulk_delete(update, context)
-    elif data == "bulk_annul":
-        await bulk_annul(update, context)
+            await callback.message.edit_text(
+                f"📅 *Введите новый срок действия (в днях)*\n\nДля ключа: `{key}`{status_info}",
+                reply_markup=get_back_keyboard(),
+                parse_mode="Markdown"
+            )
+            await callback.answer()
+            return
 
-    # Демо-ключи
-    elif data == "delete_demo_keys":
-        await delete_demo_keys(update, context)
+        # Удаление HWID
+        elif action == "clear_hwid":
+            updates = {'hwid': ""}
+            if await license_manager.update_key(key, updates):
+                await callback.message.edit_text(
+                    f"✅ *HWID успешно удален*",
+                    parse_mode="Markdown"
+                )
+                # Показываем обновленную информацию
+                await show_key_details(callback, key)
+            else:
+                await callback.message.edit_text(
+                    "❌ Ошибка при удалении HWID",
+                    reply_markup=get_back_keyboard()
+                )
+                await callback.answer()
+            return
 
-    # Экспорт/Импорт
-    elif data == "export_import_menu":
-        await export_import_menu(update, context)
-    elif data == "export_csv":
-        await export_csv(update, context)
-    elif data == "import_csv":
-        await import_csv(update, context)
+        # Переключение проверки диска
+        elif action == "toggle_disk":
+            all_keys = await license_manager.get_all_keys()
+            key_data = None
+            for k in all_keys:
+                if k['key'] == key:
+                    key_data = k
+                    break
 
-    # Обновление конфига
-    elif data == "refresh_config":
-        await refresh_config(update, context)
+            if key_data:
+                current = key_data.get('disableDiskCheck', False)
+                updates = {'disableDiskCheck': not current}
+                if await license_manager.update_key(key, updates):
+                    new_status = "🔒 Вкл" if not updates['disableDiskCheck'] else "🔓 Выкл"
+                    await callback.message.edit_text(
+                        f"✅ *Проверка диска изменена*\nНовый статус: {new_status}",
+                        parse_mode="Markdown"
+                    )
+                    # Показываем обновленную информацию
+                    await show_key_details(callback, key)
+                else:
+                    await callback.message.edit_text(
+                        "❌ Ошибка при изменении проверки диска",
+                        reply_markup=get_back_keyboard()
+                    )
+            else:
+                await callback.message.edit_text("❌ Ключ не найден")
+            await callback.answer()
+            return
 
-    # Помощь
-    elif data == "help_faq":
-        await help_faq(update, context)
+        # Деактивация ключа
+        elif action == "deactivate":
+            updates = {
+                'hasActive': False,
+                'hwid': "",
+                'issued': 0,
+                'expired': 0
+            }
+            if await license_manager.update_key(key, updates):
+                await callback.message.edit_text(
+                    f"✅ *Ключ деактивирован*",
+                    parse_mode="Markdown"
+                )
+                # Показываем обновленную информацию
+                await show_key_details(callback, key)
+            else:
+                await callback.message.edit_text(
+                    "❌ Ошибка при деактивации ключа",
+                    reply_markup=get_back_keyboard()
+                )
+            await callback.answer()
+            return
+
+        # Изменение имени пользователя
+        elif action == "customer":
+            edit_data[user_id] = {'key': key, 'action': 'customer'}
+            await state.set_state(EditStates.waiting_for_customer)
+            await callback.message.edit_text(
+                f"👤 *Введите новое имя пользователя*\n\nДля ключа: `{key}`",
+                reply_markup=get_back_keyboard(),
+                parse_mode="Markdown"
+            )
+            await callback.answer()
+            return
+
+        # Удаление ключа (с подтверждением)
+        elif action == "delete":
+            await callback.message.edit_text(
+                f"⚠️ *Вы уверены, что хотите удалить ключ?*\n\n`{key}`\n\nЭто действие нельзя отменить.",
+                reply_markup=get_confirm_delete_keyboard(key),
+                parse_mode="Markdown"
+            )
+            await callback.answer()
+            return
+
+    # Подтверждение удаления
+    if data.startswith("confirm_delete:"):
+        key = data.split(":")[1]
+        if await license_manager.delete_key(key):
+            await callback.message.edit_text(
+                f"✅ *Ключ успешно удален*",
+                parse_mode="Markdown"
+            )
+            # Возвращаемся к списку ключей
+            await show_keys_page(callback, user_id, 1)
+        else:
+            await callback.message.edit_text(
+                "❌ Ошибка при удалении ключа",
+                reply_markup=get_back_keyboard()
+            )
+        await callback.answer()
+        return
+
+    # Генерация ключа
+    if data == "generate":
+        user_states[user_id] = {'state': 'waiting_customer', 'customer': None}
+        await callback.message.edit_text(
+            "➕ *Генерация ключа*\n\nВведите имя покупателя (любые символы):",
+            reply_markup=get_back_keyboard(),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+
+    # Выбор периода для генерации
+    if data.startswith("period:"):
+        period = data.split(":")[1]
+
+        if user_id not in user_states or user_states[user_id]['state'] != 'waiting_period':
+            await callback.message.edit_text(
+                "❌ Ошибка, начните заново",
+                reply_markup=get_back_keyboard()
+            )
+            await callback.answer()
+            return
+
+        customer = user_states[user_id]['customer']
+
+        # Показываем ожидание
+        await callback.message.edit_text(
+            "🔄 *Генерация ключа...*\n\nПожалуйста, подождите.",
+            parse_mode="Markdown"
+        )
+
+        # Запускаем генератор
+        result = run_generator(customer, period)
+
+        # Очищаем состояние
+        del user_states[user_id]
+
+        # Отправляем результат с одной кнопкой "в главное меню"
+        await callback.message.answer(
+            f"{result}",
+            reply_markup=get_to_main_keyboard(),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+
+    # Поиск по ключу - запрос ввода
+    if data == "search_key":
+        await state.set_state(EditStates.waiting_for_search_key)
+        await callback.message.edit_text(
+            "🔍 *Поиск по ключу*\n\nВведите ключ для поиска:",
+            reply_markup=get_back_keyboard(),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+
+    # Поиск по пользователю - запрос ввода
+    elif data == "search_user":
+        await state.set_state(EditStates.waiting_for_search_user)
+        await callback.message.edit_text(
+            "👤 *Поиск по пользователю*\n\nВведите имя пользователя для поиска:",
+            reply_markup=get_back_keyboard(),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+
+    # FAQ
+    elif data == "faq":
+        faq_text = f"""
+❓ *FAQ* (v{BOT_VERSION})
+
+📋 *Команды:*
+• /start — вход в систему
+• /cancel — отмена действия
+
+⏰ *Сессия:* {SESSION_DURATION} минут
+• Активна пока вы пользуетесь ботом
+• Обновляется при каждом действии
+• Автоматически завершается через {SESSION_DURATION} минут бездействия
+
+📱 *Функции меню:*
+• Список ключей — просмотр всех ключей
+• Поиск по ключу — найти конкретный ключ
+• Поиск по пользователю — найти ключи пользователя
+• Генерация ключа — создать новый ключ
+• Выйти — завершить сессию
+
+🔑 *Генерация ключа:*
+• Неделя (7 дней)
+• Месяц (30 дней)
+• Год (365 дней)
+• Бессрочно
+"""
+        await callback.message.edit_text(
+            faq_text,
+            reply_markup=get_back_keyboard(),
+            parse_mode="Markdown"
+        )
+
+    await callback.answer()
 
 
-# --- ИНИЦИАЛИЗАЦИЯ ПРИ ЗАПУСКЕ ---
-async def post_init(application):
-    """Действия после инициализации бота"""
-    logger.info("🚀 Бот запускается...")
-    await db.init_pool()
-    logger.info("✅ База данных инициализирована")
+async def show_keys_page(callback: CallbackQuery, user_id: int, page: int):
+    """Показывает страницу со списком ключей"""
+    try:
+        # Получаем ключи для страницы
+        page_keys, current_page, total_pages = await license_manager.get_keys_page(page)
+
+        if not page_keys:
+            await callback.message.edit_text(
+                "📋 *Список ключей*\n\n❌ Нет доступных ключей",
+                reply_markup=get_back_keyboard(),
+                parse_mode="Markdown"
+            )
+            await callback.answer()
+            return
+
+        # Сохраняем текущую страницу
+        user_pages[user_id] = current_page
+
+        # Формируем заголовок
+        header = f"📋 *Список ключей*\nСтраница {current_page} из {total_pages}\n\n"
+
+        await callback.message.edit_text(
+            header,
+            reply_markup=get_keys_list_keyboard(page_keys, current_page, total_pages, search_mode=False),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+
+    except Exception as e:
+        logger.error(f"Error showing keys page: {e}")
+        await callback.message.edit_text(
+            "❌ Ошибка при загрузке ключей",
+            reply_markup=get_back_keyboard()
+        )
+        await callback.answer()
 
 
-async def shutdown(application):
-    """Действия при остановке бота"""
-    logger.info("🛑 Бот останавливается...")
-    await db.close_pool()
-    logger.info("✅ Соединения с БД закрыты")
+async def show_search_results(message: Message, results: List[Dict], search_type: str, query: str):
+    """Показывает результаты поиска с пагинацией"""
+    if len(results) == 1:
+        # Если найден один ключ, сразу показываем его детали
+        key_data = results[0]
+
+        # Экранируем специальные символы
+        def escape_markdown(text):
+            """Экранирует только проблемные символы для Markdown V2"""
+            if not isinstance(text, str):
+                return text
+            # Для Markdown V2 нужно экранировать: _ * [ ] ( ) ~ ` > # + - = | { } . !
+            # Но мы будем использовать Markdown V1, где точки не нужно экранировать
+            special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '!']
+            for char in special_chars:
+                text = text.replace(char, f'\\{char}')
+            return text
+
+        activated = "✅ Да" if key_data.get('hasActive') else "❌ Нет"
+        disk_check = "🔒 Вкл" if not key_data.get('disableDiskCheck') else "🔓 Выкл"
+        demo = "🎮 Да" if key_data.get('isDemo') else "🚫 Нет"
+
+        customer = escape_markdown(str(key_data.get('customer', 'Неизвестно')))
+        created = escape_markdown(str(key_data.get('created', 'Неизвестно')))
+        period = escape_markdown(str(key_data.get('period', 'Неизвестно')))
+        expired = escape_markdown(str(key_data.get('expired', '0')))
+        hwid = escape_markdown(str(key_data.get('hwid', '')))
+
+        info_text = f"""
+🔑 *Ключ:* `{key_data['key']}`
+
+👤 *Пользователь:* {customer}
+📅 *Создан:* {created}
+⏰ *Срок действия:* {period} дней
+❌ *Истекает:* {expired}
+💻 *HWID:* {hwid}
+
+*Статусы:*
+• Активирован: {activated}
+• Проверка диска: {disk_check}
+• Демо: {demo}
+"""
+
+        await message.answer(
+            info_text,
+            reply_markup=get_key_details_keyboard(key_data['key']),
+            parse_mode="Markdown"
+        )
+    else:
+        # Если несколько ключей, показываем первую страницу
+        await show_search_results_page(message, results, 1, query)
 
 
-# --- MAIN ---
-def main() -> None:
-    """Главная функция"""
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(shutdown)
-        .build()
-    )
+async def show_search_results_page(message_or_callback, results: List[Dict], page: int, query: str):
+    """Показывает страницу результатов поиска"""
+    items_per_page = 10
+    total_results = len(results)
+    total_pages = (total_results + items_per_page - 1) // items_per_page
 
-    # Добавляем обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_generate_key_input))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_csv_import))
-    application.add_handler(CallbackQueryHandler(callback_router))
+    start = (page - 1) * items_per_page
+    end = start + items_per_page
+    page_keys = results[start:end]
 
-    logger.info("✅ Бот успешно запущен и ожидает команды!")
-    application.run_polling(drop_pending_updates=True)
+    # Определяем тип поиска по первому ключу (для заголовка)
+    search_type = "ключу"
+    if results and results[0].get('customer', '').lower() == query.lower():
+        search_type = "пользователю"
+
+    header = f"🔍 *Результаты поиска по {search_type}* `{query}`\nСтраница {page} из {total_pages}\n\n"
+
+    if isinstance(message_or_callback, CallbackQuery):
+        await message_or_callback.message.edit_text(
+            header,
+            reply_markup=get_keys_list_keyboard(page_keys, page, total_pages, search_mode=True, search_query=query),
+            parse_mode="Markdown"
+        )
+    else:
+        await message_or_callback.answer(
+            header,
+            reply_markup=get_keys_list_keyboard(page_keys, page, total_pages, search_mode=True, search_query=query),
+            parse_mode="Markdown"
+        )
 
 
-if __name__ == '__main__':
-    main()
+async def show_key_details(callback: CallbackQuery, key: str):
+    """Показывает детальную информацию о ключе"""
+    try:
+        # Получаем все ключи
+        all_keys = await license_manager.get_all_keys()
+
+        # Ищем нужный ключ
+        key_data = None
+        for k in all_keys:
+            if k['key'] == key:
+                key_data = k
+                break
+
+        if not key_data:
+            await callback.message.edit_text(
+                "❌ Ключ не найден",
+                reply_markup=get_back_keyboard()
+            )
+            await callback.answer()
+            return
+
+        # Экранируем специальные символы в тексте
+        def escape_markdown(text):
+            """Экранирует только проблемные символы для Markdown V2"""
+            if not isinstance(text, str):
+                return text
+            # Для Markdown V2 нужно экранировать: _ * [ ] ( ) ~ ` > # + - = | { } . !
+            # Но мы будем использовать Markdown V1, где точки не нужно экранировать
+            special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '!']
+            for char in special_chars:
+                text = text.replace(char, f'\\{char}')
+            return text
+
+        # Формируем информацию о ключе с экранированием
+        activated = "✅ Да" if key_data.get('hasActive') else "❌ Нет"
+        disk_check = "🔒 Вкл" if not key_data.get('disableDiskCheck') else "🔓 Выкл"
+        demo = "🎮 Да" if key_data.get('isDemo') else "🚫 Нет"
+
+        customer = escape_markdown(str(key_data.get('customer', 'Неизвестно')))
+        created = escape_markdown(str(key_data.get('created', 'Неизвестно')))
+        period = escape_markdown(str(key_data.get('period', 'Неизвестно')))
+        expired = escape_markdown(str(key_data.get('expired', '0')))
+        hwid = escape_markdown(str(key_data.get('hwid', '')))
+
+        info_text = f"""
+🔑 *Ключ:* `{key_data['key']}`
+
+👤 *Пользователь:* {customer}
+📅 *Создан:* {created}
+⏰ *Срок действия:* {period} дней
+❌ *Истекает:* {expired}
+💻 *HWID:* {hwid}
+
+*Статусы:*
+• Активирован: {activated}
+• Проверка диска: {disk_check}
+• Демо: {demo}
+"""
+
+        await callback.message.edit_text(
+            info_text,
+            reply_markup=get_key_details_keyboard(key),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+
+    except Exception as e:
+        logger.error(f"Error showing key details: {e}")
+        # В случае ошибки пробуем отправить без Markdown
+        try:
+            await callback.message.edit_text(
+                f"🔑 Ключ: {key}\n\nПроизошла ошибка при форматировании. Пожалуйста, попробуйте еще раз.",
+                reply_markup=get_back_keyboard()
+            )
+        except:
+            pass
+        await callback.answer()
+
+
+async def show_key_details_direct(message: Message, key: str):
+    """Показывает детальную информацию о ключе (для прямых сообщений)"""
+    try:
+        # Получаем все ключи
+        all_keys = await license_manager.get_all_keys()
+
+        # Ищем нужный ключ
+        key_data = None
+        for k in all_keys:
+            if k['key'] == key:
+                key_data = k
+                break
+
+        if not key_data:
+            await message.answer("❌ Ключ не найден")
+            return
+
+        # Экранируем специальные символы в тексте
+        def escape_markdown(text):
+            """Экранирует только проблемные символы для Markdown V2"""
+            if not isinstance(text, str):
+                return text
+            # Для Markdown V2 нужно экранировать: _ * [ ] ( ) ~ ` > # + - = | { } . !
+            # Но мы будем использовать Markdown V1, где точки не нужно экранировать
+            special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '!']
+            for char in special_chars:
+                text = text.replace(char, f'\\{char}')
+            return text
+
+        # Формируем информацию о ключе с экранированием
+        activated = "✅ Да" if key_data.get('hasActive') else "❌ Нет"
+        disk_check = "🔒 Вкл" if not key_data.get('disableDiskCheck') else "🔓 Выкл"
+        demo = "🎮 Да" if key_data.get('isDemo') else "🚫 Нет"
+
+        customer = escape_markdown(str(key_data.get('customer', 'Неизвестно')))
+        created = escape_markdown(str(key_data.get('created', 'Неизвестно')))
+        period = escape_markdown(str(key_data.get('period', 'Неизвестно')))
+        expired = escape_markdown(str(key_data.get('expired', '0')))
+        hwid = escape_markdown(str(key_data.get('hwid', '')))
+
+        info_text = f"""
+🔑 *Ключ:* `{key_data['key']}`
+
+👤 *Пользователь:* {customer}
+📅 *Создан:* {created}
+⏰ *Срок действия:* {period} дней
+❌ *Истекает:* {expired}
+💻 *HWID:* {hwid}
+
+*Статусы:*
+• Активирован: {activated}
+• Проверка диска: {disk_check}
+• Демо: {demo}
+"""
+
+        await message.answer(
+            info_text,
+            reply_markup=get_key_details_keyboard(key),
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        logger.error(f"Error showing key details: {e}")
+        await message.answer(
+            f"❌ Ошибка при загрузке информации о ключе\n\n🔑 Ключ: {key}",
+            reply_markup=get_back_keyboard()
+        )
+
+
+# Команда /cancel
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    if user_id in user_states:
+        del user_states[user_id]
+    if user_id in user_pages:
+        del user_pages[user_id]
+    if user_id in edit_data:
+        del edit_data[user_id]
+
+    await state.clear()
+
+    if await check_session(user_id):
+        await message.answer(
+            "❌ Действие отменено.",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer("❌ Действие отменено.")
+
+
+# Ошибки
+@dp.error()
+async def errors_handler(event: types.ErrorEvent):
+    logger.error(f"Error: {event.exception}")
+
+
+async def main():
+    await db.init_db()
+    logger.info(f"Bot v{BOT_VERSION} started")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

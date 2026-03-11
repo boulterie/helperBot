@@ -13,7 +13,7 @@ import pytz
 # --- Настройка временной зоны ---
 moscow_tz = pytz.timezone('Europe/Moscow')
 
-# --- Переменные окружения ---
+# Импортируем конфигурацию
 DATABASE_URL = os.getenv('DATABASE_URL')
 
 if not DATABASE_URL:
@@ -343,7 +343,3 @@ if __name__ == "__main__":
 
     # Сохранение в Gist
     generator.save_licenses()
-
-    print(f"Используется GitHub токен: {GITHUB_TOKEN[:10]}...")
-    print(f"Gist ID: {GIST_ID}")
-    print(f"Файл: {LICENSE_FILE_IN_GIST}")
