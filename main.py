@@ -647,7 +647,13 @@ def get_key_details_keyboard(key: str):
         width=2
     )
 
-    # Кнопки навигации (7 строка, в два столбца)
+    # Новая кнопка для сообщения клиенту
+    builder.row(
+        InlineKeyboardButton(text="📨 Сообщение клиенту", callback_data=f"client_msg:{key}"),
+        width=1
+    )
+
+    # Кнопки навигации (в два столбца)
     builder.row(
         InlineKeyboardButton(text="📋 К списку", callback_data="list"),
         InlineKeyboardButton(text="🏠 Главное меню", callback_data="back"),
@@ -1058,6 +1064,37 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext):
                 parse_mode="Markdown"
             )
             await callback.answer()
+            return
+
+        # Сообщение для клиента
+        elif data.startswith("client_msg:"):
+            key = data.split(":")[1]
+
+            # Получаем данные ключа
+            all_keys = await license_manager.get_all_keys()
+            key_data = None
+            for k in all_keys:
+                if k['key'] == key:
+                    key_data = k
+                    break
+
+            if key_data:
+                message_text = f"""
+Ваш ключ активации: `{key_data['key']}`
+
+Внимательно читайте инструкцию перед применением и не запускайте программы в архиве — сначала распакуйте.
+Прежде чем задавать вопросы по работе программы, читайте инструкцию и проверяйте, всё ли вы правильно сделали.
+
+*ИНСТРУКЦИЯ ЕСТЬ В ОТПРАВЛЕННОМ ВАМ АРХИВЕ*
+"""
+
+                await callback.message.answer(
+                    message_text,
+                    parse_mode="Markdown"
+                )
+                await callback.answer("✅ Сообщение для клиента скопировано")
+            else:
+                await callback.answer("❌ Ключ не найден")
             return
 
     # Подтверждение удаления
