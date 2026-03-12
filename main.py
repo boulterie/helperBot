@@ -250,26 +250,44 @@ class LicenseManager:
         """Возвращает эмодзи статуса ключа"""
         from datetime import datetime
 
-        # Сначала проверяем, истек ли ключ (даже если он активен)
+        # Проверяем, активирован ли ключ
+        has_active = key_data.get('hasActive', False)
+
+        # Получаем дату истечения
         expired = key_data.get('expired', 0)
-        if expired != 0 and isinstance(expired, str):
+
+        # Если ключ не активирован (hasActive = False) - сразу желтый
+        if not has_active:
+            return "🟡"  # Не активирован
+
+        # Проверяем дату истечения только если ключ активирован
+        if expired and expired != 0 and expired != "0" and isinstance(expired, str) and expired.strip():
             try:
+                # Очищаем строку даты от возможных лишних пробелов
+                expired_clean = expired.strip()
+
+                # Проверяем, что строка не пустая и содержит только дату
+                # Если в строке есть время, берем только первую часть (до пробела)
+                if ' ' in expired_clean:
+                    expired_clean = expired_clean.split(' ')[0]
+
                 # Парсим дату истечения
-                expired_date = datetime.strptime(expired, "%d.%m.%Y")
+                expired_date = datetime.strptime(expired_clean, "%d.%m.%Y")
                 current_date = datetime.now()
 
                 # Если дата истечения меньше текущей даты - ключ истек
                 if expired_date < current_date:
                     return "🔴"  # Истек
+                else:
+                    return "🟢"  # Активен и не истек
+
             except Exception as e:
-                logger.error(f"Error parsing expired date: {e}")
+                logger.error(f"Error parsing expired date '{expired}': {e}")
+                # Если ошибка парсинга, считаем ключ активным (зеленый)
+                return "🟢"
 
-        # Если ключ активен и не истек
-        if key_data.get('hasActive'):
-            return "🟢"  # Активен
-
-        # Во всех остальных случаях - желтый
-        return "🟡"  # Не активирован
+        # Если нет даты истечения, но ключ активирован - зеленый
+        return "🟢"
 
     async def search_by_key(self, search_key: str) -> List[Dict]:
         """Ищет ключ по точному совпадению"""
@@ -300,26 +318,35 @@ class LicenseManager:
                 return False
 
             key_data = self.cache[key]
-            old_period = key_data.get('period', 0)
 
             # Обновляем period
             key_data['period'] = new_period
 
-            # Если ключ активирован (issued не 0 и не пустой)
+            # Если ключ активирован (issued не пустой и не 0)
             issued = key_data.get('issued', 0)
-            if issued != 0 and issued != "0" and issued:
+            if issued and issued != 0 and issued != "0" and isinstance(issued, str) and issued.strip():
                 from datetime import datetime, timedelta
                 try:
+                    # Очищаем строку даты
+                    issued_clean = issued.strip()
+                    # Если есть время, берем только дату
+                    if ' ' in issued_clean:
+                        issued_clean = issued_clean.split(' ')[0]
+
                     # Парсим дату активации
-                    issued_date = datetime.strptime(issued, "%d.%m.%Y")
+                    issued_date = datetime.strptime(issued_clean, "%d.%m.%Y")
                     # Вычисляем новую дату истечения
                     expired_date = issued_date + timedelta(days=new_period)
-                    # Форматируем обратно в строку
+                    # Форматируем обратно в строку (только дата)
                     key_data['expired'] = expired_date.strftime("%d.%m.%Y")
+
                 except Exception as e:
                     logger.error(f"Error calculating expired date: {e}")
                     # Если ошибка парсинга, оставляем expired без изменений
                     pass
+            else:
+                # Если ключ не активирован, сбрасываем expired
+                key_data['expired'] = 0
 
             # Сохраняем в Gist
             return await self.db.update_gist_data(self.cache)
@@ -337,6 +364,12 @@ class LicenseManager:
             # Обновляем данные
             for field, value in updates.items():
                 self.cache[key][field] = value
+
+            # Если деактивируем ключ, сбрасываем связанные поля
+            if updates.get('hasActive') is False:
+                self.cache[key]['issued'] = 0
+                self.cache[key]['expired'] = 0
+                # HWID уже сбрасывается в updates.get('hwid', "")
 
             # Сохраняем в Gist
             return await self.db.update_gist_data(self.cache)
