@@ -939,6 +939,37 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext):
         await show_key_details(callback, key)
         return
 
+    # Сообщение для клиента (ВЫНЕСЕНО ИЗ БЛОКА edit)
+    if data.startswith("client_msg:"):
+        key = data.split(":")[1]
+
+        # Получаем данные ключа
+        all_keys = await license_manager.get_all_keys()
+        key_data = None
+        for k in all_keys:
+            if k['key'] == key:
+                key_data = k
+                break
+
+        if key_data:
+            message_text = f"""
+Ваш ключ активации: `{key_data['key']}`
+
+Внимательно читайте инструкцию перед применением и не запускайте программы в архиве — сначала распакуйте.
+Прежде чем задавать вопросы по работе программы, читайте инструкцию и проверяйте, всё ли вы правильно сделали.
+
+*ИНСТРУКЦИЯ ЕСТЬ В ОТПРАВЛЕННОМ ВАМ АРХИВЕ*
+"""
+
+            await callback.message.answer(
+                message_text,
+                parse_mode="Markdown"
+            )
+            await callback.answer("✅ Сообщение для клиента отправлено")
+        else:
+            await callback.answer("❌ Ключ не найден")
+        return
+
     # Редактирование ключа
     if data.startswith("edit:"):
         parts = data.split(":")
@@ -1064,37 +1095,6 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext):
                 parse_mode="Markdown"
             )
             await callback.answer()
-            return
-
-        # Сообщение для клиента
-        elif data.startswith("client_msg:"):
-            key = data.split(":")[1]
-
-            # Получаем данные ключа
-            all_keys = await license_manager.get_all_keys()
-            key_data = None
-            for k in all_keys:
-                if k['key'] == key:
-                    key_data = k
-                    break
-
-            if key_data:
-                message_text = f"""
-Ваш ключ активации: `{key_data['key']}`
-
-Внимательно читайте инструкцию перед применением и не запускайте программы в архиве — сначала распакуйте.
-Прежде чем задавать вопросы по работе программы, читайте инструкцию и проверяйте, всё ли вы правильно сделали.
-
-*ИНСТРУКЦИЯ ЕСТЬ В ОТПРАВЛЕННОМ ВАМ АРХИВЕ*
-"""
-
-                await callback.message.answer(
-                    message_text,
-                    parse_mode="Markdown"
-                )
-                await callback.answer("✅ Сообщение для клиента скопировано")
-            else:
-                await callback.answer("❌ Ключ не найден")
             return
 
     # Подтверждение удаления
