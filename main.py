@@ -360,6 +360,38 @@ class LicenseManager:
             logger.error(f"Error deleting key: {e}")
             return False
 
+    async def get_filtered_keys(self, filter_mode: str) -> List[Dict]:
+        """Возвращает отфильтрованные ключи по статусу"""
+        all_keys = await self.get_all_keys()
+
+        if filter_mode == FilterStates.ALL:
+            return all_keys
+
+        filtered_keys = []
+        for key_data in all_keys:
+            status_emoji = self.get_status_emoji(key_data)
+
+            if filter_mode == FilterStates.ACTIVE and status_emoji == "🟢":
+                filtered_keys.append(key_data)
+            elif filter_mode == FilterStates.INACTIVE and status_emoji == "🟡":
+                filtered_keys.append(key_data)
+            elif filter_mode == FilterStates.EXPIRED and status_emoji == "🔴":
+                filtered_keys.append(key_data)
+
+        return filtered_keys
+
+    async def get_filtered_keys_page(self, filter_mode: str, page: int = 1) -> Tuple[List[Dict], int, int]:
+        """Возвращает отфильтрованные ключи для указанной страницы"""
+        filtered_keys = await self.get_filtered_keys(filter_mode)
+        total_keys = len(filtered_keys)
+        total_pages = (total_keys + self.keys_per_page - 1) // self.keys_per_page
+
+        start = (page - 1) * self.keys_per_page
+        end = start + self.keys_per_page
+
+        page_keys = filtered_keys[start:end]
+
+        return page_keys, page, total_pages
 
 # Создаем экземпляры
 db = LicenseBotDB()
@@ -479,9 +511,19 @@ def get_to_main_keyboard():
     return builder.as_markup()
 
 
-def get_keys_list_keyboard(page_keys: List[Dict], current_page: int, total_pages: int, search_mode: bool = False,
-                           search_query: str = ""):
-    """Клавиатура для списка ключей с пагинацией"""
+# Добавим новые состояния для фильтрации
+class FilterStates:
+    ALL = "all"
+    ACTIVE = "active"  # 🟢
+    INACTIVE = "inactive"  # 🟡
+    EXPIRED = "expired"  # 🔴
+
+
+# Обновим функцию get_keys_list_keyboard
+def get_keys_list_keyboard(page_keys: List[Dict], current_page: int, total_pages: int,
+                           search_mode: bool = False, search_query: str = "",
+                           filter_mode: str = FilterStates.ALL):
+    """Клавиатура для списка ключей с пагинацией и фильтрацией"""
     builder = InlineKeyboardBuilder()
 
     # Добавляем кнопки ключей (по одной в ряд)
@@ -491,14 +533,40 @@ def get_keys_list_keyboard(page_keys: List[Dict], current_page: int, total_pages
         button_text = f"{status_emoji} {key}"
         builder.row(InlineKeyboardButton(text=button_text, callback_data=f"key:{key}"))
 
+    # Кнопки фильтрации (всегда 3 кнопки в ряд, под ключами)
+    filter_buttons = []
+
+    # Зеленая кнопка (активные)
+    if filter_mode == FilterStates.ACTIVE:
+        filter_buttons.append(InlineKeyboardButton(text="🟢 ✅", callback_data="filter:active"))
+    else:
+        filter_buttons.append(InlineKeyboardButton(text="🟢", callback_data="filter:active"))
+
+    # Желтая кнопка (неактивные)
+    if filter_mode == FilterStates.INACTIVE:
+        filter_buttons.append(InlineKeyboardButton(text="🟡 ✅", callback_data="filter:inactive"))
+    else:
+        filter_buttons.append(InlineKeyboardButton(text="🟡", callback_data="filter:inactive"))
+
+    # Красная кнопка (истекшие)
+    if filter_mode == FilterStates.EXPIRED:
+        filter_buttons.append(InlineKeyboardButton(text="🔴 ✅", callback_data="filter:expired"))
+    else:
+        filter_buttons.append(InlineKeyboardButton(text="🔴", callback_data="filter:expired"))
+
+    builder.row(*filter_buttons, width=3)
+
     # Кнопки пагинации (всегда 3 кнопки в ряд)
     pagination_buttons = []
 
     # Левая кнопка (назад)
     if current_page > 1:
         if search_mode:
+            pagination_buttons.append(InlineKeyboardButton(text="🔙",
+                                                           callback_data=f"search_page:{search_query}:{current_page - 1}:{filter_mode}"))
+        elif filter_mode != FilterStates.ALL:
             pagination_buttons.append(
-                InlineKeyboardButton(text="🔙", callback_data=f"search_page:{search_query}:{current_page - 1}"))
+                InlineKeyboardButton(text="🔙", callback_data=f"filter_page:{filter_mode}:{current_page - 1}"))
         else:
             pagination_buttons.append(InlineKeyboardButton(text="🔙", callback_data=f"page:{current_page - 1}"))
     else:
@@ -510,8 +578,11 @@ def get_keys_list_keyboard(page_keys: List[Dict], current_page: int, total_pages
     # Правая кнопка (вперед)
     if current_page < total_pages:
         if search_mode:
+            pagination_buttons.append(InlineKeyboardButton(text="🔜",
+                                                           callback_data=f"search_page:{search_query}:{current_page + 1}:{filter_mode}"))
+        elif filter_mode != FilterStates.ALL:
             pagination_buttons.append(
-                InlineKeyboardButton(text="🔜", callback_data=f"search_page:{search_query}:{current_page + 1}"))
+                InlineKeyboardButton(text="🔜", callback_data=f"filter_page:{filter_mode}:{current_page + 1}"))
         else:
             pagination_buttons.append(InlineKeyboardButton(text="🔜", callback_data=f"page:{current_page + 1}"))
     else:
@@ -765,7 +836,21 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # Список ключей
+    # Фильтрация ключей
+    if data.startswith("filter:"):
+        filter_mode = data.split(":")[1]
+        await show_filtered_keys_page(callback, user_id, filter_mode, 1)
+        return
+
+    # Пагинация для фильтров
+    if data.startswith("filter_page:"):
+        parts = data.split(":")
+        filter_mode = parts[1]
+        page = int(parts[2])
+        await show_filtered_keys_page(callback, user_id, filter_mode, page)
+        return
+
+    # Список ключей (обычный)
     if data == "list":
         await show_keys_page(callback, user_id, 1)
         return
@@ -781,6 +866,7 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext):
         parts = data.split(":")
         search_query = parts[1]
         page = int(parts[2])
+        filter_mode = parts[3] if len(parts) > 3 else FilterStates.ALL
 
         # Определяем тип поиска (по ключу или по пользователю)
         results = await license_manager.search_by_customer(search_query)
@@ -788,7 +874,18 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext):
             results = await license_manager.search_by_key(search_query)
 
         if results:
-            await show_search_results_page(callback, results, page, search_query)
+            # Применяем фильтр к результатам поиска
+            if filter_mode != FilterStates.ALL:
+                filtered_results = []
+                for key_data in results:
+                    status_emoji = license_manager.get_status_emoji(key_data)
+                    if (filter_mode == FilterStates.ACTIVE and status_emoji == "🟢") or \
+                            (filter_mode == FilterStates.INACTIVE and status_emoji == "🟡") or \
+                            (filter_mode == FilterStates.EXPIRED and status_emoji == "🔴"):
+                        filtered_results.append(key_data)
+                results = filtered_results
+
+            await show_search_results_page(callback, results, page, search_query, filter_mode)
         else:
             await callback.message.edit_text(
                 "❌ Результаты не найдены",
@@ -1052,6 +1149,58 @@ async def handle_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def show_filtered_keys_page(callback: CallbackQuery, user_id: int, filter_mode: str, page: int):
+    """Показывает страницу с отфильтрованными ключами"""
+    try:
+        # Получаем отфильтрованные ключи для страницы
+        page_keys, current_page, total_pages = await license_manager.get_filtered_keys_page(filter_mode, page)
+
+        if not page_keys:
+            filter_names = {
+                FilterStates.ACTIVE: "активные",
+                FilterStates.INACTIVE: "неактивные",
+                FilterStates.EXPIRED: "истекшие"
+            }
+            filter_name = filter_names.get(filter_mode, "")
+            await callback.message.edit_text(
+                f"📋 *Список ключей*\n\n❌ Нет {filter_name} ключей",
+                reply_markup=get_back_keyboard(),
+                parse_mode="Markdown"
+            )
+            await callback.answer()
+            return
+
+        # Сохраняем текущую страницу
+        user_pages[user_id] = current_page
+
+        # Формируем заголовок с информацией о фильтре
+        filter_names = {
+            FilterStates.ALL: "все",
+            FilterStates.ACTIVE: "активные",
+            FilterStates.INACTIVE: "неактивные",
+            FilterStates.EXPIRED: "истекшие"
+        }
+        filter_name = filter_names.get(filter_mode, "все")
+
+        header = f"📋 *Список ключей* ({filter_name})\nСтраница {current_page} из {total_pages}\n\n"
+
+        await callback.message.edit_text(
+            header,
+            reply_markup=get_keys_list_keyboard(page_keys, current_page, total_pages,
+                                                search_mode=False, search_query="",
+                                                filter_mode=filter_mode),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+
+    except Exception as e:
+        logger.error(f"Error showing filtered keys page: {e}")
+        await callback.message.edit_text(
+            "❌ Ошибка при загрузке ключей",
+            reply_markup=get_back_keyboard()
+        )
+        await callback.answer()
+
 async def show_keys_page(callback: CallbackQuery, user_id: int, page: int):
     """Показывает страницу со списком ключей"""
     try:
@@ -1142,7 +1291,8 @@ async def show_search_results(message: Message, results: List[Dict], search_type
         await show_search_results_page(message, results, 1, query)
 
 
-async def show_search_results_page(message_or_callback, results: List[Dict], page: int, query: str):
+async def show_search_results_page(message_or_callback, results: List[Dict], page: int, query: str,
+                                   filter_mode: str = FilterStates.ALL):
     """Показывает страницу результатов поиска"""
     items_per_page = 10
     total_results = len(results)
@@ -1157,18 +1307,31 @@ async def show_search_results_page(message_or_callback, results: List[Dict], pag
     if results and results[0].get('customer', '').lower() == query.lower():
         search_type = "пользователю"
 
-    header = f"🔍 *Результаты поиска по {search_type}* `{query}`\nСтраница {page} из {total_pages}\n\n"
+    # Добавляем информацию о фильтре в заголовок
+    filter_names = {
+        FilterStates.ALL: "",
+        FilterStates.ACTIVE: " (активные)",
+        FilterStates.INACTIVE: " (неактивные)",
+        FilterStates.EXPIRED: " (истекшие)"
+    }
+    filter_suffix = filter_names.get(filter_mode, "")
+
+    header = f"🔍 *Результаты поиска по {search_type}* `{query}`{filter_suffix}\nСтраница {page} из {total_pages}\n\n"
 
     if isinstance(message_or_callback, CallbackQuery):
         await message_or_callback.message.edit_text(
             header,
-            reply_markup=get_keys_list_keyboard(page_keys, page, total_pages, search_mode=True, search_query=query),
+            reply_markup=get_keys_list_keyboard(page_keys, page, total_pages,
+                                                search_mode=True, search_query=query,
+                                                filter_mode=filter_mode),
             parse_mode="Markdown"
         )
     else:
         await message_or_callback.answer(
             header,
-            reply_markup=get_keys_list_keyboard(page_keys, page, total_pages, search_mode=True, search_query=query),
+            reply_markup=get_keys_list_keyboard(page_keys, page, total_pages,
+                                                search_mode=True, search_query=query,
+                                                filter_mode=filter_mode),
             parse_mode="Markdown"
         )
 
